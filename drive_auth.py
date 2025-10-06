@@ -68,6 +68,12 @@ def store_credentials(user_id, credentials):
     """Stores the Google Drive credentials (refresh token) for a user."""
     try:
         doc_ref = get_token_doc_ref(user_id)
+        # ONLY store if a refresh_token is present
+        if not credentials.refresh_token:
+            print(f"Skipping credential storage for {user_id}: No refresh token received.")
+            # If no refresh token, we skip storage but don't error out. The error is returned to the user via the Flask route.
+            return 
+            
         token_data = {
             'refresh_token': credentials.refresh_token,
             'client_id': credentials.client_id,
@@ -131,12 +137,8 @@ def generate_auth_url(public_url):
 
     try:
         # 2. Determine Client Type and set flow arguments
-        
-        # Check if the JSON contains the 'web' key for Web Application flow
         is_web_app = 'web' in client_secrets_json_data
 
-        # We must read the configuration from the file we just wrote
-        # Using Flow base class instead of InstalledAppFlow to be explicit, though functionality is similar
         flow = Flow.from_client_secrets_file(
             SECRETS_FILE_PATH, 
             DRIVE_SCOPE
@@ -152,7 +154,8 @@ def generate_auth_url(public_url):
 
         auth_url, _ = flow.authorization_url(
             access_type='offline',
-            include_granted_scopes='true'
+            include_granted_scopes='true',
+            prompt='consent' # <-- FORCING CONSENT TO ENSURE REFRESH TOKEN IS ISSUED
         )
 
         # 5. Success
@@ -179,7 +182,7 @@ def exchange_code_for_token(auth_code, public_url):
         )
         flow.redirect_uri = redirect_uri # Set redirect_uri on flow object
 
-        # Exchange the code. No need to pass redirect_uri as keyword argument here either.
+        # Exchange the code.
         flow.fetch_token(code=auth_code)
             
         return flow.credentials, None
