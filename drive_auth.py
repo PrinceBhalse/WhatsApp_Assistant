@@ -2,7 +2,8 @@ import os
 import json
 import firebase_admin
 from firebase_admin import firestore
-from google_auth_oauthlib.flow import InstalledAppFlow
+# Changed import name to reflect the need for the base Flow class
+from google_auth_oauthlib.flow import Flow 
 from google.auth.transport.requests import Request
 from urllib.parse import urlparse
 
@@ -33,8 +34,10 @@ def initialize_firestore_client():
             firebase_config_str = os.getenv('__firebase_config')
             if not firebase_config_str:
                 print("FATAL: Firebase config not found in __firebase_config environment variable.")
+                # We return False but allow the app to start so the user sees the message
                 return False
             
+            # The Admin SDK expects a dict, which the env var provides as a JSON string
             firebase_config = json.loads(firebase_config_str)
             
             # Initialize the Firebase App
@@ -82,9 +85,6 @@ def load_credentials(user_id):
         doc = doc_ref.get()
         if doc.exists:
             token_data = doc.to_dict()
-            # The token data is not a complete Credentials object, but contains the necessary parts
-            # to be used by the google-auth library.
-            # We don't need to rebuild Credentials object unless making API call.
             return token_data
         return None
     except Exception as e:
@@ -134,38 +134,33 @@ def generate_auth_url(public_url):
         is_web_app = 'web' in client_secrets_json_data
 
         # We must read the configuration from the file we just wrote
-        flow = InstalledAppFlow.from_client_secrets_file(
+        # Using Flow base class instead of InstalledAppFlow to be explicit, though functionality is similar
+        flow = Flow.from_client_secrets_file(
             SECRETS_FILE_PATH, 
             DRIVE_SCOPE
         )
 
-        # 3. Conditionally add redirect_uri based on client type
-        # The 'redirect_uri' parameter is ONLY expected for Web Applications
-        # If we pass it for an 'installed' (Desktop) app, it throws the error:
-        # "got an unexpected keyword argument 'redirect_uri'"
-        
+        # 3. Conditionally set the redirect_uri on the flow object
         redirect_uri = public_url + "/oauth/callback"
+        flow.redirect_uri = redirect_uri
+        
+        # 4. Generate the URL
+        # For Web Applications, the library automatically looks up redirect_uri 
+        # from the flow object AND the client secrets file. 
+        # Passing it as a keyword argument causes the "multiple values" error.
+        
+        # Check if the client type is 'installed' based on the JSON content
+        if not is_web_app:
+            # If it's not a web app, the library expects http://localhost, and our redirect_uri 
+            # will likely cause errors on Google's side, but we should generate the URL anyway.
+            print("WARNING: Client type detected as 'installed'. Authorization will likely fail on Google's side.")
 
-        if is_web_app:
-            # For Web App, we pass the custom redirect_uri
-            auth_url, _ = flow.authorization_url(
-                redirect_uri=redirect_uri,
-                access_type='offline',
-                include_granted_scopes='true'
-            )
-        else:
-            # For Installed App, the library expects no redirect_uri argument
-            # This is the fix for the persistent error.
-            auth_url, _ = flow.authorization_url(
-                access_type='offline',
-                include_granted_scopes='true'
-            )
-            # IMPORTANT: If this runs, the callback will go to http://localhost, which is wrong for Render.
-            # This confirms the configuration MUST be a Web App.
-            print("WARNING: Client type detected as 'installed'. Authorization will fail on Render.")
+        auth_url, _ = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true'
+        )
 
-
-        # 4. Success
+        # 5. Success
         return auth_url, None
 
     except Exception as e:
@@ -176,38 +171,29 @@ def generate_auth_url(public_url):
 def exchange_code_for_token(auth_code, public_url):
     """Exchanges the authorization code for an access/refresh token."""
     
-    # 1. Ensure secrets are loaded and written to file
     if not write_secrets_to_file():
         return None, "Error: Invalid or missing Google Drive secrets configuration."
 
     try:
-        # 2. Determine Client Type and set flow arguments
         is_web_app = 'web' in client_secrets_json_data
         redirect_uri = public_url + "/oauth/callback"
 
-        flow = InstalledAppFlow.from_client_secrets_file(
+        flow = Flow.from_client_secrets_file(
             SECRETS_FILE_PATH, 
             DRIVE_SCOPE
         )
+        flow.redirect_uri = redirect_uri # Set redirect_uri on flow object
 
-        # 3. Conditionally fetch token based on client type
-        if is_web_app:
-            # For Web App, we must supply the redirect_uri used in the authorization step
-            flow.fetch_token(code=auth_code, redirect_uri=redirect_uri)
-        else:
-            # For Installed App, we do not supply redirect_uri
-            flow.fetch_token(code=auth_code)
-            print("WARNING: Client type detected as 'installed'. Token exchange may fail.")
+        # Exchange the code. No need to pass redirect_uri as keyword argument here either.
+        flow.fetch_token(code=auth_code)
             
-        # 4. Success
         return flow.credentials, None
 
     except Exception as e:
-        # This catches errors during the token exchange (e.g., invalid code, client ID)
         print(f"Error exchanging code for token: {e}")
         return None, f"Error exchanging code for token: {e}"
 
-# --- Utility for Drive API Calls ---
+# --- Utility for Drive API Calls (unchanged) ---
 
 def build_drive_service(user_id):
     """Builds a credentials object using the stored refresh token."""
@@ -215,7 +201,6 @@ def build_drive_service(user_id):
     if not token_data:
         return None, "Drive not connected. Send 'SETUP' first."
     
-    # Check if secrets were loaded (necessary for rebuilding credentials)
     if not client_secrets_json_data and not write_secrets_to_file():
         return None, "Failed to load client configuration."
         
@@ -238,8 +223,6 @@ def build_drive_service(user_id):
             scopes=token_data.get('scopes')
         )
         
-        # NOTE: Drive Service object is usually built using googleapiclient.discovery.build
-        # We only return the Credentials object here, as the Flask app handles the API call.
         return creds, None
 
     except Exception as e:
@@ -247,4 +230,8 @@ def build_drive_service(user_id):
         return None, f"Error building credentials: {e}"
 
 # Ensure Firestore is initialized on load
-initialize_firestore_client()
+# This is wrapped to prevent app crash if config is missing
+if initialize_firestore_client():
+    print("Firestore initialization confirmed.")
+else:
+    print("Firestore initialization skipped due to missing config.")
