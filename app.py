@@ -2,16 +2,16 @@ import os
 import json
 from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
+# Note the updated signature for generate_auth_url
 from drive_auth import generate_auth_url, exchange_code_for_token, build_drive_service, store_credentials
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
-import urllib.parse
 import base64
+import re # Added regex for cleanup
 
 app = Flask(__name__)
 
 # --- Configuration ---
-# Your Render public URL (e.g., https://my-app.onrender.com)
 PUBLIC_URL = os.getenv('RENDER_EXTERNAL_URL') or 'http://localhost:5000'
 
 # --- Utility Functions ---
@@ -21,6 +21,9 @@ def get_user_id(request_form):
     # Twilio sends the number in the format: "whatsapp:+1234567890"
     from_number = request_form.get('From', '')
     user_id = from_number.split(':')[-1]
+    
+    # Strip non-numeric characters (like +) for a clean Firestore key
+    user_id = re.sub(r'[^\d]', '', user_id)
     
     if not user_id:
         print("Warning: Could not extract user_id from Twilio payload.")
@@ -47,8 +50,6 @@ def format_drive_response(file_list, folder_name):
         
         line = f"({i+1}) {name}"
         if link:
-            # We don't want to use the long link URL in the message body, 
-            # we just confirm the link exists.
             line += " (Link available)"
             
         message += line + "\n"
@@ -71,20 +72,17 @@ def whatsapp_message():
     if command.upper() == 'SETUP':
         
         # CRITICAL FIX: Pass the user_id in the state parameter
-        # We URL-safe base64 encode the user_id to ensure it survives the trip
+        # 1. URL-safe base64 encode the user_id to ensure it survives the trip
         encoded_user_id = base64.urlsafe_b64encode(user_id.encode()).decode()
         
-        auth_url, error = generate_auth_url(PUBLIC_URL)
+        # 2. Generate auth URL, passing the encoded user ID as the state
+        # generate_auth_url must now accept the encoded_user_id as its second argument
+        auth_url, error = generate_auth_url(PUBLIC_URL, encoded_user_id)
         if error:
             print(f"Setup Error for {user_id}: {error}")
             return send_whatsapp_message(f"Error initiating setup. Check logs for missing client_secrets.json or configuration: {error}")
         
-        # Append the encoded user_id to the authorization URL state parameter
-        # The library generates a state, we append our custom info to it
-        # We assume the library's generated state is already in auth_url, so we append our parameter cleanly.
-        auth_url_with_state = f"{auth_url}&custom_user_id_state={encoded_user_id}"
-        
-        message = f"*Google Drive Setup Required*\n\nPlease click the link below to securely authorize this app to access your Google Drive. This only needs to be done once.\n\n{auth_url_with_state}\n\nThis link will expire shortly."
+        message = f"*Google Drive Setup Required*\n\nPlease click the link below to securely authorize this app to access your Google Drive. This only needs to be done once.\n\n{auth_url}\n\nThis link will expire shortly."
         return send_whatsapp_message(message)
 
     elif command.upper().startswith('LIST/'):
@@ -145,25 +143,26 @@ def whatsapp_message():
 def oauth_callback():
     """Handles the redirect from Google after user authorization."""
     auth_code = request.args.get('code')
-    
-    # CRITICAL FIX: Extract the custom user_id from the query parameters
-    encoded_user_id = request.args.get('custom_user_id_state')
+    # CRITICAL: Get user ID from the 'state' parameter, which was set to the encoded user ID
+    encoded_user_id = request.args.get('state') 
 
     if not auth_code:
         return "Authorization Failed. No code received.", 400
 
-    # 1. Decode user_id from the custom state parameter
+    # 1. Decode user_id from the state parameter
     user_id = None
     try:
         if encoded_user_id:
             user_id = base64.urlsafe_b64decode(encoded_user_id).decode()
+            # Clean up the ID one last time (e.g., remove '+' if it was included in encoding)
+            user_id = re.sub(r'[^\d]', '', user_id) 
         
         if not user_id:
              print("Error: Could not decode user_id from state parameter.")
              return "Authorization Failed. Internal error: User identifier missing.", 400
         
     except Exception as e:
-        print(f"Error decoding user_id from custom state: {e}")
+        print(f"Error decoding user_id from state: {e}")
         return "Authorization Failed. Internal error: User identifier decoding failed.", 400
 
     print(f"Callback received for user: {user_id}. Attempting token exchange.")
@@ -179,9 +178,6 @@ def oauth_callback():
         store_credentials(user_id, credentials)
         
     return "Success! Google Drive authorization was successful. You may now return to WhatsApp and test with the **LIST/Documents** command.", 200
-
-# Ensure Drive service initialization runs once on app load
-# (This is handled by drive_auth.py's global call)
 
 if __name__ == '__main__':
     app.run(debug=True, port=int(os.environ.get('PORT', 5000)))
