@@ -136,6 +136,7 @@ def whatsapp_message():
         
         os.makedirs(TEMP_DIR, exist_ok=True)
         temp_file_path_full = f"{TEMP_FILE_PATH}_{os.urandom(4).hex()}"
+        result_msg = "" # Initialize result message for UPLOAD
         
         try:
             with open(temp_file_path_full, 'wb') as f:
@@ -144,79 +145,88 @@ def whatsapp_message():
             # 2. Upload using drive_assistant logic
             print(f"[{user_id}] Attempting upload of '{drive_file_name}' to folder '{folder_path}'")
             result_msg = drive_assistant.upload_file(drive, folder_path, temp_file_path_full, drive_file_name)
-            return send_whatsapp_response(result_msg)
-
+            
         except Exception as e:
             print(f"Error during UPLOAD processing: {e}")
-            return send_whatsapp_response(f"An error occurred during file processing or upload: {e}")
+            result_msg = f"An error occurred during file processing or upload: {e}"
         finally:
             # 3. Clean up the temporary file
             if os.path.exists(temp_file_path_full):
                 os.remove(temp_file_path_full)
                 print(f"Cleaned up temporary file: {temp_file_path_full}")
-        
-        return send_whatsapp_response("Processing file upload...")
+                
+        return send_whatsapp_response(result_msg)
 
 
     # 3. Command Parsing (Non-media commands)
     
+    result_msg = "" # Initialize result message for all text commands
+    
     # Check for RENAME first, as it uses spaces and breaks the slash logic
     if msg_body.upper().startswith('RENAME '):
         # Format: RENAME OldFileName.ext NewFileName.ext
-        # We split by space, limit to 3 parts: RENAME, OldName, NewName
         parts = [p.strip() for p in msg_body.strip().split(' ', 3) if p.strip()]
         
-        # The command is the first part (RENAME), we need exactly two more arguments.
-        if len(parts) == 3:
-            old_file_name = parts[1]
-            new_file_name = parts[2]
-            print(f"[{user_id}] Processing RENAME command: from '{old_file_name}' to '{new_file_name}'")
-            result = drive_assistant.rename_file(drive, old_file_name, new_file_name)
-            return send_whatsapp_response(result)
-        
-        # If the number of parts is wrong, return an error message specific to RENAME
-        return send_whatsapp_response("Invalid RENAME format. Use: RENAME OldFileName.ext NewFileName.ext")
+        try:
+            if len(parts) == 3:
+                old_file_name = parts[1]
+                new_file_name = parts[2]
+                print(f"[{user_id}] Processing RENAME command: from '{old_file_name}' to '{new_file_name}'")
+                result_msg = drive_assistant.rename_file(drive, old_file_name, new_file_name)
+            else:
+                result_msg = "Invalid RENAME format. Use: RENAME OldFileName.ext NewFileName.ext"
+        except Exception as e:
+            print(f"Error during RENAME command execution: {e}")
+            result_msg = f"❌ An unexpected error occurred during the RENAME command: {e}"
+            
+        return send_whatsapp_response(result_msg)
 
 
     # Standard slash parsing for all remaining commands (LIST, DELETE, MOVE, SUMMARY)
     command_parts = msg_body.strip().upper().split('/', 1)
     command = command_parts[0]
     arg_string = command_parts[1] if len(command_parts) > 1 else None
+    
+    if drive and arg_string: # Only process commands that have an argument and the drive is initialized
 
-    if drive:
-        print(f"[{user_id}] Processing text command: {command} with args: {arg_string}")
+        try:
+            print(f"[{user_id}] Processing text command: {command} with args: {arg_string}")
+            
+            # --- LIST Command ---
+            if command == 'LIST':
+                result_msg = drive_assistant.list_files(drive, arg_string)
+            
+            # --- DELETE Command ---
+            elif command == 'DELETE':
+                # Format: DELETE/Folder/FileName.ext
+                parts = [p.strip() for p in arg_string.split('/', 1) if p.strip()]
+                if len(parts) == 2:
+                    result_msg = drive_assistant.delete_file(drive, parts[0], parts[1])
+                else:
+                    result_msg = "Invalid DELETE format. Use: DELETE/FolderName/FileName.ext"
 
-        # --- LIST Command ---
-        if command == 'LIST' and arg_string:
-            result = drive_assistant.list_files(drive, arg_string)
-            return send_whatsapp_response(result)
-        
-        # --- DELETE Command ---
-        elif command == 'DELETE' and arg_string:
-            # Format: DELETE/Folder/FileName.ext
-            parts = [p.strip() for p in arg_string.split('/', 1) if p.strip()]
-            if len(parts) == 2:
-                result = drive_assistant.delete_file(drive, parts[0], parts[1])
-                return send_whatsapp_response(result)
-            return send_whatsapp_response("Invalid DELETE format. Use: DELETE/FolderName/FileName.ext")
-
-        # --- MOVE Command ---
-        elif command == 'MOVE' and arg_string:
-            # Format: MOVE/SourceFolder/FileName.ext/DestFolder
-            # Note: The split limit (2) ensures the filename part can contain slashes if needed, 
-            # though it should ideally not if it is just a filename. We are splitting the ArgString into 3 parts.
-            parts = [p.strip() for p in arg_string.split('/', 2) if p.strip()]
-            if len(parts) == 3:
-                result = drive_assistant.move_file(drive, parts[0], parts[1], parts[2])
-                return send_whatsapp_response(result)
-            return send_whatsapp_response("Invalid MOVE format. Use: MOVE/SourceFolder/FileName.ext/DestFolder")
+            # --- MOVE Command ---
+            elif command == 'MOVE':
+                # Format: MOVE/SourceFolder/FileName.ext/DestFolder
+                parts = [p.strip() for p in arg_string.split('/', 2) if p.strip()]
+                if len(parts) == 3:
+                    result_msg = drive_assistant.move_file(drive, parts[0], parts[1], parts[2])
+                else:
+                    result_msg = "Invalid MOVE format. Use: MOVE/SourceFolder/FileName.ext/DestFolder"
 
 
-        # --- SUMMARY Command ---
-        elif command == 'SUMMARY' and arg_string:
-            # Format: SUMMARY/FolderName
-            result = drive_assistant.summarize_folder(drive, arg_string, OPENAI_API_KEY, OPENAI_MODEL_NAME)
-            return send_whatsapp_response(result)
+            # --- SUMMARY Command ---
+            elif command == 'SUMMARY':
+                # Format: SUMMARY/FolderName
+                result_msg = drive_assistant.summarize_folder(drive, arg_string, OPENAI_API_KEY, OPENAI_MODEL_NAME)
+                
+            if result_msg:
+                # This ensures any non-empty result message is sent successfully
+                return send_whatsapp_response(result_msg)
+            
+        except Exception as e:
+            print(f"Error during command execution for {command}: {e}")
+            return send_whatsapp_response(f"❌ An unexpected error occurred during the {command} command: {e}")
 
 
     # 4. Fallback/Help
