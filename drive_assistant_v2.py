@@ -15,7 +15,7 @@ except ImportError:
             raise NotImplementedError("OpenAI library not available. Cannot use SUMMARY command.")
         
 
-# --- Utility: Drive API Helper Functions ---
+# --- Utility: Drive API Helper Functions (No changes needed here, they are stable) ---
 
 def get_folder_id(service, folder_path):
     """
@@ -36,7 +36,6 @@ def get_folder_id(service, folder_path):
             "trashed=false"
         )
         
-        # CORRECT NATIVE API CALL: service.files().list()
         try:
             response = service.files().list(
                 q=query,
@@ -52,7 +51,7 @@ def get_folder_id(service, folder_path):
         if files:
             parent_id = files[0]['id']
         else:
-            return None # Folder not found at this level
+            return None 
             
     return parent_id
 
@@ -68,7 +67,6 @@ def get_file_by_name(service, name, parent_id='root'):
         "trashed=false"
     )
     
-    # CORRECT NATIVE API CALL: service.files().list()
     try:
         response = service.files().list(
             q=query,
@@ -93,7 +91,6 @@ def get_file_by_name_anywhere(service, name):
         "trashed=false"
     )
     
-    # CORRECT NATIVE API CALL: service.files().list()
     try:
         response = service.files().list(
             q=query,
@@ -126,7 +123,6 @@ def list_files(service, folder_path):
     )
     
     try:
-        # CORRECT NATIVE API CALL: service.files().list()
         response = service.files().list(
             q=query,
             spaces='drive',
@@ -166,7 +162,6 @@ def upload_file(service, folder_path, local_file_path, drive_file_name):
     Uploads a local file to the specified Drive folder.
     Command: UPLOAD /FolderName NewFileName.ext
     """
-    # This step calls get_folder_id, which was causing the error. Now fixed.
     folder_id = get_folder_id(service, folder_path) 
     if not folder_id:
         return f"❌ Upload failed: Target folder not found: /{folder_path}. Remember to create the folder first."
@@ -188,18 +183,20 @@ def upload_file(service, folder_path, local_file_path, drive_file_name):
         
         media = MediaFileUpload(local_file_path, mimetype=mime_type, resumable=True)
         
-        # Use native API: drive.files().create()
         file = service.files().create(
             body=file_metadata,
             media_body=media,
             fields='id, name'
         ).execute()
         
-        return f"✅ Successfully uploaded '{file.get('name')}' to /{folder_path}."
+        # --- CRITICAL CHANGE: Ensure simple string return ---
+        return f"✅ Successfully uploaded '{file.get('name')}' to /{folder_path}." 
 
     except HttpError as error:
-        return f"❌ Upload error: {error}"
+        # Return HTTP error specifically
+        return f"❌ Upload HTTP error: {error}"
     except Exception as e:
+        # Return general exception
         return f"❌ Upload error: {e}"
 
 
@@ -218,7 +215,6 @@ def delete_file(service, folder_path, file_name):
         return f"❌ Delete failed: File '{file_name}' not found in /{folder_path}."
         
     try:
-        # To delete (move to trash), update the 'trashed' property to True
         service.files().update(
             fileId=file_info['id'],
             body={'trashed': True},
@@ -248,7 +244,6 @@ def move_file(service, src_folder, file_name, dest_folder):
         return f"❌ Move failed: File '{file_name}' not found in /{src_folder}."
         
     try:
-        # Use the native API update method to remove the parent and add a new one
         service.files().update(
             fileId=file_info['id'],
             addParents=dest_id,
@@ -272,7 +267,6 @@ def rename_file(service, old_name, new_name):
         return f"❌ Rename failed: File '{old_name}' not found in your Drive."
         
     try:
-        # Update file metadata with the new name
         service.files().update(
             fileId=file_info['id'],
             body={'name': new_name},
@@ -298,17 +292,16 @@ def summarize_folder(service, folder_path, openai_api_key, openai_model_name):
 
     query = (
         f"'{folder_id}' in parents and "
-        "mimeType contains 'text/' and " # Target text documents
+        "mimeType contains 'text/' and " 
         "trashed=false"
     )
     
-    # List files to summarize
     try:
         response = service.files().list(
             q=query,
             spaces='drive',
             fields='files(id, name, mimeType)',
-            pageSize=10 # Limit the number of documents to read
+            pageSize=10
         ).execute()
     except HttpError as error:
         return f"❌ Error listing files for summary: {error}"
@@ -319,14 +312,12 @@ def summarize_folder(service, folder_path, openai_api_key, openai_model_name):
         
     full_text = ""
     
-    # Download content of each text document
     for file in files:
         file_id = file['id']
         file_name = file['name']
         mime_type = file['mimeType']
         
         try:
-            # Only download plain text files (for simplicity in this single file example)
             if mime_type.startswith('text/'):
                 request = service.files().get_media(fileId=file_id)
             else:
@@ -338,7 +329,6 @@ def summarize_folder(service, folder_path, openai_api_key, openai_model_name):
             while done is False:
                 status, done = downloader.next_chunk()
             
-            # Append content to the full text
             full_text += f"\n\n--- Start of {file_name} ---\n"
             full_text += fh.getvalue().decode('utf-8')
             full_text += f"\n--- End of {file_name} ---\n"
@@ -350,7 +340,6 @@ def summarize_folder(service, folder_path, openai_api_key, openai_model_name):
     if not full_text:
         return "⚠️ Summary failed: Could not read content from any text file."
 
-    # Use OpenAI to summarize
     try:
         client = OpenAI(api_key=openai_api_key)
         
