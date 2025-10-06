@@ -1,196 +1,187 @@
 import os
 import json
-from flask import Flask, request, jsonify, redirect, url_for
+from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
-from drive_auth import generate_auth_url, exchange_code_for_token, store_credentials, build_drive_service # Corrected import
+from drive_auth import generate_auth_url, exchange_code_for_token, build_drive_service, store_credentials
+from googleapiclient.errors import HttpError
+from google.oauth2.credentials import Credentials
+import urllib.parse
+import base64
 
-# Imports for actual Drive API calls (we only need discovery for building the service)
-from googleapiclient.discovery import build
-from google.auth.transport.requests import Request as GoogleAuthRequest
-
-# --- App Initialization ---
 app = Flask(__name__)
 
-# Environment variables
-PUBLIC_URL = os.getenv('PUBLIC_URL')
-TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
-TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+# --- Configuration ---
+# Your Render public URL (e.g., https://my-app.onrender.com)
+PUBLIC_URL = os.getenv('RENDER_EXTERNAL_URL') or 'http://localhost:5000'
 
-if not PUBLIC_URL:
-    print("FATAL: PUBLIC_URL environment variable not set.")
+# --- Utility Functions ---
 
-# --- Twilio Webhook ---
+def get_user_id(request_form):
+    """Extracts the unique user ID (WhatsApp number) from the Twilio request."""
+    # Twilio sends the number in the format: "whatsapp:+1234567890"
+    from_number = request_form.get('From', '')
+    user_id = from_number.split(':')[-1]
+    
+    if not user_id:
+        print("Warning: Could not extract user_id from Twilio payload.")
+        return from_number
+        
+    print(f"Extracted User ID: {user_id}")
+    return user_id
+
+def send_whatsapp_message(text):
+    """Creates a Twilio TwiML response for WhatsApp."""
+    resp = MessagingResponse()
+    resp.message(text)
+    return str(resp)
+
+def format_drive_response(file_list, folder_name):
+    """Formats the list of Google Drive files into a concise WhatsApp message."""
+    if not file_list:
+        return f"No files found in folder: '{folder_name}'"
+    
+    message = f"Files in '{folder_name}':\n"
+    for i, item in enumerate(file_list[:10]): 
+        name = item.get('name', 'Untitled')
+        link = item.get('webViewLink')
+        
+        line = f"({i+1}) {name}"
+        if link:
+            # We don't want to use the long link URL in the message body, 
+            # we just confirm the link exists.
+            line += " (Link available)"
+            
+        message += line + "\n"
+        
+    if len(file_list) > 10:
+        message += f"\n...and {len(file_list) - 10} more."
+        
+    return message.strip()
+
+# --- Flask Routes ---
 
 @app.route("/whatsapp/message", methods=['POST'])
-def whatsapp_reply():
-    """Handles incoming WhatsApp messages."""
-    try:
-        incoming_msg = request.values.get('Body', '').strip().upper()
-        user_id = request.values.get('From')
+def whatsapp_message():
+    """Handles incoming WhatsApp messages from Twilio."""
+    user_id = get_user_id(request.form)
+    command = request.form.get('Body', '').strip()
+
+    print(f"Received command: '{command}' from user: {user_id}")
+
+    if command.upper() == 'SETUP':
         
-        # --- Handle SETUP Command ---
-        if incoming_msg == 'SETUP':
-            return handle_setup_command(user_id)
+        # CRITICAL FIX: Pass the user_id in the state parameter
+        # We URL-safe base64 encode the user_id to ensure it survives the trip
+        encoded_user_id = base64.urlsafe_b64encode(user_id.encode()).decode()
         
-        # --- Handle LIST Command ---
-        elif incoming_msg.startswith('LIST/'):
-            folder_path = incoming_msg[5:].strip()
-            return handle_list_command(user_id, folder_path)
+        auth_url, error = generate_auth_url(PUBLIC_URL)
+        if error:
+            print(f"Setup Error for {user_id}: {error}")
+            return send_whatsapp_message(f"Error initiating setup. Check logs for missing client_secrets.json or configuration: {error}")
+        
+        # Append the encoded user_id to the authorization URL state parameter
+        # The library generates a state, we append our custom info to it
+        # We assume the library's generated state is already in auth_url, so we append our parameter cleanly.
+        auth_url_with_state = f"{auth_url}&custom_user_id_state={encoded_user_id}"
+        
+        message = f"*Google Drive Setup Required*\n\nPlease click the link below to securely authorize this app to access your Google Drive. This only needs to be done once.\n\n{auth_url_with_state}\n\nThis link will expire shortly."
+        return send_whatsapp_message(message)
+
+    elif command.upper().startswith('LIST/'):
+        # 1. Extract folder name
+        try:
+            folder_name = command.split('/', 1)[1].strip()
+        except IndexError:
+            return send_whatsapp_message("Invalid LIST command. Format must be LIST/<Folder Name> (e.g., LIST/Reports)")
+        
+        # 2. Get Drive service
+        drive_service, auth_error = build_drive_service(user_id)
+        
+        if auth_error:
+            # auth_error is 'Drive not connected. Send 'SETUP' first.'
+            return send_whatsapp_message(auth_error + "\n\nPlease send the *SETUP* command to connect Google Drive.")
+
+        # 3. Search Drive
+        try:
+            # Search for the folder ID first
+            folder_q = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
+            folder_results = drive_service.files().list(
+                q=folder_q,
+                spaces='drive',
+                fields='nextPageToken, files(id, name)',
+                pageSize=1
+            ).execute()
             
-        # --- Default Response ---
-        else:
-            resp = MessagingResponse()
-            msg = resp.message(f"Hello! Your ID: {user_id.split(':')[-1]}\n\nCommands:\n- **SETUP**: Start Google Drive connection.\n- **LIST/FolderName**: List contents of a folder (e.g., LIST/Reports).")
-            return str(resp)
+            folders = folder_results.get('files', [])
+            if not folders:
+                return send_whatsapp_message(f"Folder '{folder_name}' not found in your Drive root.")
+            
+            folder_id = folders[0]['id']
+            
+            # Search for files within that folder
+            file_q = f"'{folder_id}' in parents and trashed=false"
+            results = drive_service.files().list(
+                q=file_q,
+                spaces='drive',
+                fields='nextPageToken, files(id, name, webViewLink)',
+                pageSize=10 
+            ).execute()
+            
+            items = results.get('files', [])
+            
+            return send_whatsapp_message(format_drive_response(items, folder_name))
 
-    except Exception as e:
-        print(f"General error processing message: {e}")
-        # Notify user of internal error
-        resp = MessagingResponse()
-        resp.message(f"🤖 An internal error occurred while processing your request. Error: {e}")
-        return str(resp)
+        except HttpError as e:
+            print(f"Drive API Error: {e}")
+            return send_whatsapp_message(f"Error accessing Google Drive API. Code: {e.resp.status}. Please try *SETUP* again if the issue persists.")
+        except Exception as e:
+            print(f"Unexpected error during LIST command: {e}")
+            return send_whatsapp_message(f"An unexpected error occurred: {e}")
 
-def handle_setup_command(user_id):
-    """Initiates the Google Drive authorization flow."""
-    resp = MessagingResponse()
-    
-    auth_url, error = generate_auth_url(PUBLIC_URL)
-    
-    if error:
-        print(f"Setup Error for {user_id}: {error}")
-        resp.message(f"Error initiating setup. Check logs for missing client_secrets.json or configuration: {error}")
     else:
-        message = (
-            f"⚙️ **Google Drive Setup Required** ⚙️\n\n"
-            f"Please click the link below to securely authorize this app to access your Google Drive. This only needs to be done once.\n\n"
-            f"{auth_url}\n\n"
-            f"This link will expire shortly."
-        )
-        resp.message(message)
-    
-    return str(resp)
-
-def handle_list_command(user_id, folder_path):
-    """Lists files in the specified Google Drive folder."""
-    resp = MessagingResponse()
-
-    # 1. Load credentials
-    creds, error = build_drive_service(user_id)
-    if error:
-        resp.message(error + "\nPlease send the **SETUP** command to connect Google Drive.")
-        return str(resp)
-
-    # 2. Build the Drive Service
-    try:
-        drive_service = build('drive', 'v3', credentials=creds)
-        
-        # 3. Find the folder ID (This is a simplified approach, real path resolution is complex)
-        
-        # We assume folder_path is the exact name of a folder in the root directory for simplicity.
-        # This is a very basic lookup and should be improved in a real production app.
-        folder_query = f"name='{folder_path}' and mimeType='application/vnd.google-apps.folder' and 'root' in parents and trashed=false"
-        
-        folder_results = drive_service.files().list(
-            q=folder_query,
-            spaces='drive',
-            fields='files(id, name)',
-            pageSize=1
-        ).execute()
-        
-        folders = folder_results.get('files', [])
-        if not folders:
-            resp.message(f"❌ Folder '{folder_path}' not found in your Drive root or you lack permission.")
-            return str(resp)
-            
-        folder_id = folders[0]['id']
-
-        # 4. List files in the folder
-        files_query = f"'{folder_id}' in parents and trashed=false"
-        
-        file_results = drive_service.files().list(
-            q=files_query,
-            spaces='drive',
-            fields='files(name, mimeType)',
-            pageSize=10  # Limit to 10 files for WhatsApp message size
-        ).execute()
-
-        files = file_results.get('files', [])
-        
-        if not files:
-            message = f"✅ Folder '{folder_path}' is empty."
-        else:
-            file_list = "\n".join([f"{i+1}. {f['name']} ({f['mimeType'].split('.')[-1]})" for i, f in enumerate(files)])
-            message = f"✅ **Drive Access Confirmed**\n\nFiles found in '{folder_path}' (Top 10):\n{file_list}"
-
-    except Exception as e:
-        print(f"Drive API Error for user {user_id}: {e}")
-        resp.message(f"Drive API Error: Failed to list files. Ensure the folder name is exact. Error: {e}")
-        return str(resp)
-
-    resp.message(message)
-    return str(resp)
-
-
-# --- Google OAuth Callback ---
+        return send_whatsapp_message("Unknown command. Supported commands are *SETUP* and *LIST/<Folder Name>* (e.g., LIST/Reports).")
 
 @app.route("/oauth/callback", methods=['GET'])
 def oauth_callback():
-    """Receives the authorization code from Google and exchanges it for a token."""
+    """Handles the redirect from Google after user authorization."""
     auth_code = request.args.get('code')
-    state = request.args.get('state')
     
+    # CRITICAL FIX: Extract the custom user_id from the query parameters
+    encoded_user_id = request.args.get('custom_user_id_state')
+
     if not auth_code:
-        return f"<h1>Error: Missing authorization code.</h1><p>Please ensure you are clicking the link in the correct session.</p>"
+        return "Authorization Failed. No code received.", 400
 
-    # Use a dummy user_id for the token exchange phase, as the real one isn't available here,
-    # but the token exchange relies on the client secrets and code.
-    # In a real app, 'state' would contain the user_id. We'll use a placeholder for now.
-    user_id = 'whatsapp_user_id_placeholder' 
-
-    creds, error = exchange_code_for_token(auth_code, PUBLIC_URL)
-    
-    if error:
-        return f"<h1>Token Exchange Failed</h1><p>Error: {error}</p>"
-    
-    if creds.refresh_token is None:
-        return "<h1>Authorization Failed</h1><p>The authorization grant did not include a refresh token. Ensure you are granting 'offline' access.</p>"
+    # 1. Decode user_id from the custom state parameter
+    user_id = None
+    try:
+        if encoded_user_id:
+            user_id = base64.urlsafe_b64decode(encoded_user_id).decode()
         
-    # In a fully implemented version, we would use the 'state' parameter to retrieve the real user_id.
-    # Since we can't reliably get the WhatsApp number in the callback, we will rely on the user 
-    # being the one who initiated the request. This part is complex to secure without
-    # a proper state management system (which requires a session ID we don't have).
-    # We will skip storage here since we cannot reliably map the token back to the user.
-    # The actual token storage needs to happen in the Flask app. 
+        if not user_id:
+             print("Error: Could not decode user_id from state parameter.")
+             return "Authorization Failed. Internal error: User identifier missing.", 400
+        
+    except Exception as e:
+        print(f"Error decoding user_id from custom state: {e}")
+        return "Authorization Failed. Internal error: User identifier decoding failed.", 400
+
+    print(f"Callback received for user: {user_id}. Attempting token exchange.")
     
-    # Since we can't get the user_id here, we'll return success and rely on the SETUP step
-    # failing until the user explicitly fixes the Firestore config.
-    
-    return "<h1>Success!</h1><p>Google Drive authorization was successful. You may now return to WhatsApp and test with the **LIST/Reports** command.</p>"
+    # 2. Exchange the code for the token
+    credentials, error = exchange_code_for_token(auth_code, PUBLIC_URL)
 
-# The token must be stored, but since we cannot get the WhatsApp user_id from the Google callback
-# (as we didn't pass it securely via the 'state' parameter), we will leave this as a success message
-# and assume the user will not close the app right after. The real storage logic needs to be in 
-# a full-fledged Flask app with session management. For the internship project demo, the flow is validated.
-# To make this demo work, we will store the token to the 'placeholder' user if you are testing solo.
-# NOTE: The storage logic below is only added to make the single-user demo work.
-if not os.getenv('IS_TESTING', 'False').lower() == 'true':
-    @app.route("/oauth/callback", methods=['GET'])
-    def oauth_callback_with_storage():
-        auth_code = request.args.get('code')
-        user_id = 'whatsapp_user_id_placeholder' 
+    if error:
+        return f"Authorization Failed\nError: {error}", 400
 
-        if not auth_code:
-            return "<h1>Error: Missing authorization code.</h1>"
+    # 3. Store the refresh token against the correct user ID
+    if credentials:
+        store_credentials(user_id, credentials)
+        
+    return "Success! Google Drive authorization was successful. You may now return to WhatsApp and test with the **LIST/Documents** command.", 200
 
-        creds, error = exchange_code_for_token(auth_code, PUBLIC_URL)
-        if error:
-            return f"<h1>Token Exchange Failed</h1><p>Error: {error}</p>"
-        if creds.refresh_token is None:
-            return "<h1>Authorization Failed</h1><p>The authorization grant did not include a refresh token. Ensure you are granting 'offline' access.</p>"
-            
-        store_credentials(user_id, creds)
-        return "<h1>Success!</h1><p>Google Drive authorization was successful and credentials have been stored. You may now return to WhatsApp and test with the **LIST/Reports** command.</p>"
+# Ensure Drive service initialization runs once on app load
+# (This is handled by drive_auth.py's global call)
 
-
-if __name__ == "__main__":
-    app.run(debug=True, port=int(os.environ.get("PORT", 5000)))
+if __name__ == '__main__':
+    app.run(debug=True, port=int(os.environ.get('PORT', 5000)))
