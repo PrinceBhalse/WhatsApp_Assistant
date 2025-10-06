@@ -23,10 +23,18 @@ OPENAI_MODEL_NAME = os.getenv('OPENAI_MODEL_NAME', 'gpt-3.5-turbo')
 # --- Utility Functions for WhatsApp Response ---
 
 def send_whatsapp_response(msg=""):
-    """Helper function to create a TwiML response."""
-    resp = MessagingResponse()
-    resp.message(msg)
-    return str(resp)
+    """
+    Helper function to create a TwiML response.
+    Uses explicit TwiML construction with CDATA to handle raw, messy AI text safely.
+    """
+    # Force convert to ASCII to strip any remaining non-standard characters, 
+    # then wrap the clean text in a CDATA block for maximum TwiML compatibility.
+    safe_msg = msg.encode('ascii', 'ignore').decode('ascii')
+    
+    twiml = (
+        f'<Response><Message><Body><![CDATA[{safe_msg}]]></Body></Message></Response>'
+    )
+    return twiml
 
 
 # --- Drive Service Builder (Assuming this is already working and returns a native API service) ---
@@ -210,18 +218,13 @@ def whatsapp_message():
                 result_msg = "Invalid MOVE format. Use: MOVE/SourceFolder/FileName.ext/DestFolder"
 
 
-        # --- SUMMARY Command (Final Fix applied here) ---
+        # --- SUMMARY Command ---
         elif command == 'SUMMARY' and arg_string:
             # Format: SUMMARY/FolderName
             try:
                 # Call the summary logic
                 summary_text = drive_assistant.summarize_folder(drive, arg_string, OPENAI_API_KEY, OPENAI_MODEL_NAME)
-                
-                # FINAL SANITIZATION STEP: Ensure text is clean ASCII for TwiML
-                # This is the last resort to eliminate smart quotes or odd characters
-                safe_text = summary_text.encode('ascii', 'ignore').decode('ascii')
-                
-                result_msg = safe_text
+                result_msg = summary_text
 
             except Exception as e:
                 # Catch any error during summary generation or API call
