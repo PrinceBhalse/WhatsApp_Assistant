@@ -109,29 +109,23 @@ def whatsapp_message():
         return send_whatsapp_response(f"Error: {auth_error}. Please send 'SETUP' to connect your Drive.")
 
     # 2. Media Handling (UPLOAD) - Runs if media is present AND command starts with UPLOAD
-    # Command format: UPLOAD /Reports new_report.pdf
     if num_media > 0 and drive:
 
         command_match = re.match(r'UPLOAD\s+(/[^\s]+)(?:\s+(.+))?', msg_body.strip(), re.IGNORECASE)
 
         if not command_match:
-            # If a file is attached but the caption doesn't look like UPLOAD
             return send_whatsapp_response(
                 "File attached, but missing or invalid UPLOAD command. Use: UPLOAD /<Folder Name> <New File Name.ext>")
 
-        folder_path = command_match.group(1).strip('/')  # e.g., 'Reports'
-        new_file_name_input = command_match.group(2)  # e.g., 'new_report.pdf'
-
-        # Get original file name from Twilio, used if user doesn't specify a new name
+        folder_path = command_match.group(1).strip('/')
+        new_file_name_input = command_match.group(2)
         default_file_name = request.values.get('MediaFilename0', f"WhatsApp_Upload_{os.urandom(4).hex()}")
         drive_file_name = new_file_name_input or default_file_name
 
         media_url = request.values.get('MediaUrl0')
 
-        # 1. Fetch the media file and save temporarily
         print(f"[{user_id}] Fetching media from URL: {media_url}")
 
-        # We need Twilio credentials to download media securely
         media_response = requests.get(media_url, auth=(os.getenv('TWILIO_ACCOUNT_SID'), os.getenv('TWILIO_AUTH_TOKEN')))
 
         if media_response.status_code != 200:
@@ -140,24 +134,19 @@ def whatsapp_message():
 
         os.makedirs(TEMP_DIR, exist_ok=True)
         temp_file_path_full = f"{TEMP_FILE_PATH}_{os.urandom(4).hex()}"
-        
-        # Initialize result_msg here for safe return
         result_msg = "Processing file upload..." 
 
         try:
             with open(temp_file_path_full, 'wb') as f:
                 f.write(media_response.content)
 
-            # 2. Upload using drive_assistant logic
             print(f"[{user_id}] Attempting upload of '{drive_file_name}' to folder '{folder_path}'")
             result_msg = drive_assistant.upload_file(drive, folder_path, temp_file_path_full, drive_file_name)
-            # The result is returned inside the finally block, which is key to avoid interfering with other commands
 
         except Exception as e:
             print(f"Error during UPLOAD processing: {e}")
             result_msg = f"An error occurred during file processing or upload: {e}"
         finally:
-            # 3. Clean up the temporary file
             if os.path.exists(temp_file_path_full):
                 os.remove(temp_file_path_full)
                 print(f"Cleaned up temporary file: {temp_file_path_full}")
@@ -168,28 +157,24 @@ def whatsapp_message():
 
     # Check for RENAME first, as it uses spaces and breaks the slash logic
     if msg_body.upper().startswith('RENAME '):
-        # Format: RENAME OldFileName.ext NewFileName.ext
-        # We split by space, limit to 3 parts: RENAME, OldName, NewName
         parts = [p.strip() for p in msg_body.strip().split(' ', 3) if p.strip()]
-        result_msg = "" # Initialize result for RENAME
+        result_msg = "Invalid RENAME format. Use: RENAME OldFileName.ext NewFileName.ext"
 
-        # The command is the first part (RENAME), we need exactly two more arguments.
         if len(parts) == 3:
             old_file_name = parts[1]
             new_file_name = parts[2]
             print(f"[{user_id}] Processing RENAME command: from '{old_file_name}' to '{new_file_name}'")
             
             try:
-                # *** Minimal Fix: Execute and capture result here ***
+                # The returned success/error message from rename_file is now guaranteed to be captured
                 result_msg = drive_assistant.rename_file(drive, old_file_name, new_file_name)
             except Exception as e:
                 print(f"Error during RENAME execution: {e}")
                 result_msg = f"❌ An error occurred during rename: {e}"
             
-            return send_whatsapp_response(result_msg)
+        # *** Guaranteed Response for RENAME block ***
+        return send_whatsapp_response(result_msg)
 
-        # If the number of parts is wrong, return an error message specific to RENAME
-        return send_whatsapp_response("Invalid RENAME format. Use: RENAME OldFileName.ext NewFileName.ext")
 
     # Standard slash parsing for all remaining commands (LIST, DELETE, MOVE, SUMMARY)
     command_parts = msg_body.strip().upper().split('/', 1)
@@ -198,7 +183,7 @@ def whatsapp_message():
 
     if drive:
         print(f"[{user_id}] Processing text command: {command} with args: {arg_string}")
-        result_msg = "" # Initialize result for slash commands
+        result_msg = ""
 
         # --- LIST Command ---
         if command == 'LIST' and arg_string:
@@ -206,7 +191,6 @@ def whatsapp_message():
 
         # --- DELETE Command ---
         elif command == 'DELETE' and arg_string:
-            # Format: DELETE/Folder/FileName.ext
             parts = [p.strip() for p in arg_string.split('/', 1) if p.strip()]
             if len(parts) == 2:
                 result_msg = drive_assistant.delete_file(drive, parts[0], parts[1])
@@ -215,7 +199,6 @@ def whatsapp_message():
 
         # --- MOVE Command ---
         elif command == 'MOVE' and arg_string:
-            # Format: MOVE/SourceFolder/FileName.ext/DestFolder
             parts = [p.strip() for p in arg_string.split('/', 2) if p.strip()]
             if len(parts) == 3:
                 result_msg = drive_assistant.move_file(drive, parts[0], parts[1], parts[2])
@@ -225,10 +208,8 @@ def whatsapp_message():
 
         # --- SUMMARY Command ---
         elif command == 'SUMMARY' and arg_string:
-            # Format: SUMMARY/FolderName
             result_msg = drive_assistant.summarize_folder(drive, arg_string, OPENAI_API_KEY, OPENAI_MODEL_NAME)
         
-        # Return the result if any command was executed
         if result_msg:
             return send_whatsapp_response(result_msg)
 
@@ -248,6 +229,5 @@ def whatsapp_message():
 
 
 if __name__ == '__main__':
-    # Ensure client secrets are loaded at startup
     drive_auth.write_secrets_to_file()
     app.run(debug=True, host='0.0.0.0', port=os.environ.get('PORT', 5000))
