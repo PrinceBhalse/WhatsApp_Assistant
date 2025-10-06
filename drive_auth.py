@@ -5,6 +5,7 @@ from firebase_admin import firestore
 from google_auth_oauthlib.flow import Flow 
 from google.auth.transport.requests import Request
 from urllib.parse import urlparse
+import base64 # Added base64 import
 
 # --- Configuration ---
 DRIVE_SCOPE = ['https://www.googleapis.com/auth/drive'] 
@@ -18,7 +19,7 @@ app_id = os.getenv('__app_id', 'default-app-id')
 TEMP_DIR = os.getenv('TEMP_DIR', '/tmp') 
 SECRETS_FILE_PATH = os.path.join(TEMP_DIR, 'client_secrets.json')
 
-# --- Helper Functions ---
+# --- Helper Functions (omitted for brevity, assume they are correct from last turn) ---
 
 def initialize_firestore_client():
     """Initializes the Firestore client and attempts to authenticate."""
@@ -52,9 +53,7 @@ def get_db():
 
 def get_token_doc_ref(user_id):
     """Gets the Firestore Document Reference for a user's token."""
-    # Ensure Firestore is initialized before creating references
     if get_db():
-        # Private data path: /artifacts/{appId}/users/{userId}/tokens/{tokenDoc}
         return db.document(f'artifacts/{app_id}/users/{user_id}/tokens/drive_token')
     return None
 
@@ -66,7 +65,6 @@ def store_credentials(user_id, credentials):
         return
 
     try:
-        # ONLY store if a refresh_token is present
         if not credentials.refresh_token:
             print(f"Skipping credential storage for {user_id}: No refresh token received.")
             return 
@@ -101,7 +99,6 @@ def load_credentials(user_id):
         print(f"No token found for user: {user_id} at path: {doc_ref.path}")
         return None
     except Exception as e:
-        # This will catch the SERVICE_DISABLED (403) errors during token loading
         print(f"Error loading credentials for {user_id}: {e}")
         return None
 
@@ -114,10 +111,7 @@ def write_secrets_to_file():
     secrets_content = os.getenv('GOOGLE_DRIVE_SECRETS_CONTENT')
     if secrets_content:
         try:
-            # 1. Store the JSON data globally for inspection
             client_secrets_json_data = json.loads(secrets_content)
-            
-            # 2. WRITE the content to the file the library expects
             os.makedirs(TEMP_DIR, exist_ok=True)
             with open(SECRETS_FILE_PATH, 'w') as f:
                 f.write(secrets_content)
@@ -133,13 +127,15 @@ def write_secrets_to_file():
 
 # --- Core OAuth Functions ---
 
-def generate_auth_url(public_url):
-    """Generates the Google authorization URL."""
+def generate_auth_url(public_url, encoded_user_id):
+    """Generates the Google authorization URL, using encoded_user_id as state."""
     
+    # 1. Ensure secrets are loaded and written to file
     if not write_secrets_to_file():
         return None, "Error: Invalid or missing Google Drive secrets configuration."
 
     try:
+        # 2. Determine Client Type and set flow arguments
         is_web_app = 'web' in client_secrets_json_data
 
         flow = Flow.from_client_secrets_file(
@@ -147,18 +143,24 @@ def generate_auth_url(public_url):
             DRIVE_SCOPE
         )
 
+        # 3. Conditionally set the redirect_uri on the flow object
         redirect_uri = public_url + "/oauth/callback"
         flow.redirect_uri = redirect_uri
         
+        # 4. Generate the URL, passing our custom encoded user ID as the state
         if not is_web_app:
             print("WARNING: Client type detected as 'installed'. Authorization will likely fail on Google's side.")
 
+        # CRITICAL FIX: The library generates a state token by default. 
+        # We pass our encoded user ID as the custom state argument.
         auth_url, _ = flow.authorization_url(
+            state=encoded_user_id, # <--- Pass the encoded user ID directly as state
             access_type='offline',
             include_granted_scopes='true',
             prompt='consent' 
         )
 
+        # 5. Success
         return auth_url, None
 
     except Exception as e:
@@ -189,7 +191,7 @@ def exchange_code_for_token(auth_code, public_url):
         print(f"Error exchanging code for token: {e}")
         return None, f"Error exchanging code for token: {e}"
 
-# --- Utility for Drive API Calls ---
+# --- Utility for Drive API Calls (omitted for brevity) ---
 
 def build_drive_service(user_id):
     """Builds a credentials object using the stored refresh token."""
@@ -208,10 +210,8 @@ def build_drive_service(user_id):
         else:
             return None, "Invalid Google Drive secrets file type."
 
-        # Import the build function here to avoid circular imports and only if necessary
         from googleapiclient.discovery import build
         
-        # Rebuild Credentials object from stored data and client config
         creds = Request().make_authorization_credentials(
             token=None, 
             refresh_token=token_data.get('refresh_token'),
@@ -221,7 +221,6 @@ def build_drive_service(user_id):
             scopes=token_data.get('scopes')
         )
         
-        # Build the service object
         service = build('drive', 'v3', credentials=creds)
         return service, None
 
