@@ -8,9 +8,11 @@ from google.oauth2.credentials import Credentials
 from urllib.parse import urlparse
 import base64 
 
+# REQUIRED IMPORTS FOR PYDRIVE2 FIX
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+
 # --- Configuration ---
-# NOTE: The dependency on googleapiclient.discovery.build is removed,
-# as the main app will use the creds object directly with pydrive2.
 DRIVE_SCOPE = ['https://www.googleapis.com/auth/drive'] 
 
 # Global variables (Initialized later)
@@ -77,7 +79,10 @@ def store_credentials(user_id, credentials):
             'client_id': credentials.client_id,
             'client_secret': credentials.client_secret,
             'token_uri': credentials.token_uri,
-            'scopes': credentials.scopes
+            'scopes': credentials.scopes,
+            # Also store the current access token for immediate use by pydrive2
+            'access_token': credentials.token, 
+            'token_expiry': credentials.expiry.isoformat() if credentials.expiry else None
         }
         doc_ref.set(token_data)
         print(f"Credentials successfully stored for user: {user_id}")
@@ -137,15 +142,13 @@ def generate_auth_url(public_url, encoded_user_id):
     try:
         flow = Flow.from_client_secrets_file(SECRETS_FILE_PATH, DRIVE_SCOPE)
         redirect_uri = public_url + "/oauth/callback"
-        flow.redirect_uri = redirect_uri # Set redirect_uri on the flow object
+        flow.redirect_uri = redirect_uri
         
-        # FIX: The error is caused by passing 'redirect_uri' again inside authorization_url()
         auth_url, _ = flow.authorization_url(
             state=encoded_user_id,
             access_type='offline',
             include_granted_scopes='true',
             prompt='consent' 
-            # REMOVED: redundant 'redirect_uri' argument that caused the error
         )
         return auth_url, None
     except Exception as e:
@@ -167,48 +170,57 @@ def exchange_code_for_token(auth_code, public_url):
         print(f"Error exchanging code for token: {e}")
         return None, f"Error exchanging code for token: {e}"
 
-# This function is not used in the existing app.py but is necessary for pydrive2
+# --- PYDRIVE2 COMPATIBILITY FIX ---
+
 def build_drive_credentials(user_id):
-    """Builds and refreshes a Credentials object using the stored refresh token."""
+    """
+    FIX: Now returns a configured pydrive2.auth.GoogleAuth object, 
+    which correctly handles token expiration and refreshing required by pydrive2.
+    """
     token_data = load_credentials(user_id)
     if not token_data:
         return None, "Drive not connected. Send 'SETUP' first."
     
-    if not client_secrets_json_data and not write_secrets_to_file():
-        return None, "Failed to load client configuration."
-        
+    # 1. Initialize GoogleAuth
+    # The 'settings' argument points pydrive2 to the client secrets file
+    gauth = GoogleAuth(settings={'client_config_file': SECRETS_FILE_PATH})
+    
+    # 2. Load the token data into pydrive2's format
     try:
-        # Reconstruct Credentials object using the data loaded from Firestore
-        creds = Credentials(
-            token=None, 
-            refresh_token=token_data.get('refresh_token'),
-            client_id=token_data.get('client_id'),
-            client_secret=token_data.get('client_secret'),
-            token_uri=token_data.get('token_uri'),
-            scopes=token_data.get('scopes')
-        )
+        # pydrive2 needs the token saved in its internal format (a dictionary)
+        pydrive2_token = {
+            'refresh_token': token_data.get('refresh_token'),
+            'access_token': token_data.get('access_token'), # Use the last known token
+            'token_expiry': token_data.get('token_expiry'),
+            'client_id': token_data.get('client_id'),
+            'client_secret': token_data.get('client_secret'),
+            'token_uri': token_data.get('token_uri'),
+            'scope': token_data.get('scopes')
+        }
         
-        # Request a fresh access token using the refresh token
-        creds.refresh(Request())
+        # 3. Set the loaded credentials. This creates the necessary internal attributes.
+        gauth.LoadCredentials(pydrive2_token)
         
-        # Return the credential object itself, which PyDrive2 needs
-        return creds, None
+        # 4. Check if we need to refresh (pydrive2's internal mechanism)
+        if gauth.access_token_expired:
+            gauth.Refresh()
+            
+        return gauth, None
 
     except Exception as e:
-        print(f"Error building or refreshing credentials: {e}")
-        return None, f"Error building or refreshing credentials: '{e}'"
+        print(f"Error building or refreshing pydrive2 credentials: {e}")
+        return None, f"Error building or refreshing pydrive2 credentials: '{e}'"
 
-# Assuming your existing drive_auth.py has this placeholder for the drive service
+
 def build_drive_service(user_id):
-    """Gets the PyDrive2 GoogleDrive object."""
-    creds, auth_error = build_drive_credentials(user_id)
+    """Gets the PyDrive2 GoogleDrive object using the compatible GoogleAuth object."""
+    gauth, auth_error = build_drive_credentials(user_id)
     if auth_error:
         return None, auth_error
     
     try:
-        # Initialize GoogleDrive using the authenticated credentials
-        from pydrive2.drive import GoogleDrive # Local import for isolation
-        drive = GoogleDrive(auth=creds)
+        # Initialize GoogleDrive using the configured GoogleAuth object
+        drive = GoogleDrive(gauth)
         return drive, None
     except Exception as e:
         return None, f"Error initializing GoogleDrive (PyDrive2): {e}"
