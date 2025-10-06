@@ -8,7 +8,9 @@ from google.auth.transport.requests import Request
 from urllib.parse import urlparse
 
 # --- Configuration ---
-DRIVE_SCOPE = ['https://www.googleapis.com/auth/drive.metadata.readonly']
+# UPDATED SCOPE: Use the full 'drive' scope, as the user is granting it anyway and
+# the broader scope is necessary for listing files (not just metadata).
+DRIVE_SCOPE = ['https://www.googleapis.com/auth/drive'] 
 
 # Global variables (Initialized later)
 db = None
@@ -145,14 +147,7 @@ def generate_auth_url(public_url):
         flow.redirect_uri = redirect_uri
         
         # 4. Generate the URL
-        # For Web Applications, the library automatically looks up redirect_uri 
-        # from the flow object AND the client secrets file. 
-        # Passing it as a keyword argument causes the "multiple values" error.
-        
-        # Check if the client type is 'installed' based on the JSON content
         if not is_web_app:
-            # If it's not a web app, the library expects http://localhost, and our redirect_uri 
-            # will likely cause errors on Google's side, but we should generate the URL anyway.
             print("WARNING: Client type detected as 'installed'. Authorization will likely fail on Google's side.")
 
         auth_url, _ = flow.authorization_url(
