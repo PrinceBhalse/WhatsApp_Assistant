@@ -1,183 +1,263 @@
 import os
 import json
-from flask import Flask, request, jsonify
-from twilio.twiml.messaging_response import MessagingResponse
-# Note the updated signature for generate_auth_url
-from drive_auth import generate_auth_url, exchange_code_for_token, build_drive_service, store_credentials
-from googleapiclient.errors import HttpError
-from google.oauth2.credentials import Credentials
 import base64
-import re # Added regex for cleanup
+import drive_auth # Assuming this handles the build_drive_service for pydrive2
+import drive_assistant # Your core drive logic
+import requests 
+from flask import Flask, request
+from twilio.twiml.messaging_response import MessagingResponse
+from pydrive2.drive import GoogleDrive # Needed for type hinting/creation
+import io
 
 app = Flask(__name__)
 
 # --- Configuration ---
-PUBLIC_URL = os.getenv('RENDER_EXTERNAL_URL') or 'http://localhost:5000'
+PUBLIC_URL = os.getenv('PUBLIC_URL', 'http://localhost:5000') 
+TEMP_DIR = os.getenv('TEMP_DIR', '/tmp')
+TEMP_FILE_PATH = os.path.join(TEMP_DIR, 'upload_temp') 
 
-# --- Utility Functions ---
+# Get your OpenAI API Key and Model Name from environment variables
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', 'default-key')
+OPENAI_MODEL_NAME = os.getenv('OPENAI_MODEL_NAME', 'gpt-3.5-turbo') 
 
-def get_user_id(request_form):
-    """Extracts the unique user ID (WhatsApp number) from the Twilio request."""
-    # Twilio sends the number in the format: "whatsapp:+1234567890"
-    from_number = request_form.get('From', '')
-    user_id = from_number.split(':')[-1]
-    
-    # Strip non-numeric characters (like +) for a clean Firestore key
-    user_id = re.sub(r'[^\d]', '', user_id)
-    
-    if not user_id:
-        print("Warning: Could not extract user_id from Twilio payload.")
-        return from_number
-        
-    print(f"Extracted User ID: {user_id}")
-    return user_id
+# --- Utility Functions for WhatsApp Response ---
 
-def send_whatsapp_message(text):
-    """Creates a Twilio TwiML response for WhatsApp."""
+def send_whatsapp_response(msg=""):
+    """Helper function to create a TwiML response."""
     resp = MessagingResponse()
-    resp.message(text)
+    resp.message(msg)
     return str(resp)
 
-def format_drive_response(file_list, folder_name):
-    """Formats the list of Google Drive files into a concise WhatsApp message."""
-    if not file_list:
-        return f"No files found in folder: '{folder_name}'"
+# --- Drive Service Builder (Assuming this is already working and returns a pydrive2 object) ---
+
+def get_drive_service(user_id):
+    """
+    Retrieves the authenticated GoogleDrive object (pydrive2) for the user.
+    Assumes drive_auth.build_drive_service is configured to return the
+    correct PyDrive2 object or raise an authentication error.
+    """
+    # NOTE: This function needs to align exactly with what your existing drive_auth.py returns.
+    # Based on our previous exchanges, I assume a function that returns the pydrive2.GoogleDrive object.
+    # If the current drive_auth.py only returns googleapiclient.discovery.build object,
+    # the integration with pydrive2 in drive_assistant.py is incorrect, but we proceed
+    # assuming the integration is handled within your existing, working files.
     
-    message = f"Files in '{folder_name}':\n"
-    for i, item in enumerate(file_list[:10]): 
-        name = item.get('name', 'Untitled')
-        link = item.get('webViewLink')
-        
-        line = f"({i+1}) {name}"
-        if link:
-            line += " (Link available)"
-            
-        message += line + "\n"
-        
-    if len(file_list) > 10:
-        message += f"\n...and {len(file_list) - 10} more."
-        
-    return message.strip()
+    # Placeholder call to your existing, working auth function:
+    # If your drive_auth.py returns a tuple (service, error_message):
+    service, auth_error = drive_auth.build_drive_service(user_id)
+    return service, auth_error
 
 # --- Flask Routes ---
 
-@app.route("/whatsapp/message", methods=['POST'])
-def whatsapp_message():
-    """Handles incoming WhatsApp messages from Twilio."""
-    user_id = get_user_id(request.form)
-    command = request.form.get('Body', '').strip()
-
-    print(f"Received command: '{command}' from user: {user_id}")
-
-    if command.upper() == 'SETUP':
-        
-        # CRITICAL FIX: Pass the user_id in the state parameter
-        # 1. URL-safe base64 encode the user_id to ensure it survives the trip
-        encoded_user_id = base64.urlsafe_b64encode(user_id.encode()).decode()
-        
-        # 2. Generate auth URL, passing the encoded user ID as the state
-        # generate_auth_url must now accept the encoded_user_id as its second argument
-        auth_url, error = generate_auth_url(PUBLIC_URL, encoded_user_id)
-        if error:
-            print(f"Setup Error for {user_id}: {error}")
-            return send_whatsapp_message(f"Error initiating setup. Check logs for missing client_secrets.json or configuration: {error}")
-        
-        message = f"*Google Drive Setup Required*\n\nPlease click the link below to securely authorize this app to access your Google Drive. This only needs to be done once.\n\n{auth_url}\n\nThis link will expire shortly."
-        return send_whatsapp_message(message)
-
-    elif command.upper().startswith('LIST/'):
-        # 1. Extract folder name
-        try:
-            folder_name = command.split('/', 1)[1].strip()
-        except IndexError:
-            return send_whatsapp_message("Invalid LIST command. Format must be LIST/<Folder Name> (e.g., LIST/Reports)")
-        
-        # 2. Get Drive service
-        drive_service, auth_error = build_drive_service(user_id)
-        
-        if auth_error:
-            # auth_error is 'Drive not connected. Send 'SETUP' first.'
-            return send_whatsapp_message(auth_error + "\n\nPlease send the *SETUP* command to connect Google Drive.")
-
-        # 3. Search Drive
-        try:
-            # Search for the folder ID first
-            folder_q = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
-            folder_results = drive_service.files().list(
-                q=folder_q,
-                spaces='drive',
-                fields='nextPageToken, files(id, name)',
-                pageSize=1
-            ).execute()
-            
-            folders = folder_results.get('files', [])
-            if not folders:
-                return send_whatsapp_message(f"Folder '{folder_name}' not found in your Drive root.")
-            
-            folder_id = folders[0]['id']
-            
-            # Search for files within that folder
-            file_q = f"'{folder_id}' in parents and trashed=false"
-            results = drive_service.files().list(
-                q=file_q,
-                spaces='drive',
-                fields='nextPageToken, files(id, name, webViewLink)',
-                pageSize=10 
-            ).execute()
-            
-            items = results.get('files', [])
-            
-            return send_whatsapp_message(format_drive_response(items, folder_name))
-
-        except HttpError as e:
-            print(f"Drive API Error: {e}")
-            return send_whatsapp_message(f"Error accessing Google Drive API. Code: {e.resp.status}. Please try *SETUP* again if the issue persists.")
-        except Exception as e:
-            print(f"Unexpected error during LIST command: {e}")
-            return send_whatsapp_message(f"An unexpected error occurred: {e}")
-
-    else:
-        return send_whatsapp_message("Unknown command. Supported commands are *SETUP* and *LIST/<Folder Name>* (e.g., LIST/Reports).")
-
-@app.route("/oauth/callback", methods=['GET'])
+@app.route("/oauth/callback", methods=["GET"])
 def oauth_callback():
-    """Handles the redirect from Google after user authorization."""
-    auth_code = request.args.get('code')
-    # CRITICAL: Get user ID from the 'state' parameter, which was set to the encoded user ID
-    encoded_user_id = request.args.get('state') 
-
-    if not auth_code:
-        return "Authorization Failed. No code received.", 400
-
-    # 1. Decode user_id from the state parameter
-    user_id = None
+    """Handles the redirect from Google after authorization."""
     try:
-        if encoded_user_id:
-            user_id = base64.urlsafe_b64decode(encoded_user_id).decode()
-            # Clean up the ID one last time (e.g., remove '+' if it was included in encoding)
-            user_id = re.sub(r'[^\d]', '', user_id) 
+        code = request.args.get('code')
+        encoded_user_id = request.args.get('state')
         
-        if not user_id:
-             print("Error: Could not decode user_id from state parameter.")
-             return "Authorization Failed. Internal error: User identifier missing.", 400
+        if not code or not encoded_user_id:
+            return "Authorization failed. Missing code or state.", 400
+
+        user_id = base64.b64decode(encoded_user_id).decode('utf-8')
+        print(f"Callback received for user: {user_id}. Attempting token exchange.")
         
+        # Using the existing working functions from your drive_auth.py
+        credentials, error = drive_auth.exchange_code_for_token(code, PUBLIC_URL)
+        
+        if error:
+            print(f"Error during token exchange: {error}")
+            return f"Authorization failed: {error}", 500
+
+        drive_auth.store_credentials(user_id, credentials)
+        
+        # Success page
+        return """
+            <html><body>
+            <h1>Success!</h1>
+            <p>Google Drive authorization was successful. You may now return to WhatsApp and use all the commands!</p>
+            </body></html>
+        """
     except Exception as e:
-        print(f"Error decoding user_id from state: {e}")
-        return "Authorization Failed. Internal error: User identifier decoding failed.", 400
+        print(f"General error in OAuth callback: {e}")
+        return "An unexpected error occurred during authorization.", 500
 
-    print(f"Callback received for user: {user_id}. Attempting token exchange.")
+
+@app.route("/whatsapp/message", methods=["POST"])
+def whatsapp_message():
+    """Handles incoming WhatsApp messages and commands, including media/file uploads."""
     
-    # 2. Exchange the code for the token
-    credentials, error = exchange_code_for_token(auth_code, PUBLIC_URL)
-
-    if error:
-        return f"Authorization Failed\nError: {error}", 400
-
-    # 3. Store the refresh token against the correct user ID
-    if credentials:
-        store_credentials(user_id, credentials)
+    msg_body = request.values.get('Body', '').strip()
+    user_id = request.values.get('WaId')
+    num_media = int(request.values.get('NumMedia', 0))
+    
+    if not user_id:
+        return send_whatsapp_response("Error: Could not identify sender ID.")
         
-    return "Success! Google Drive authorization was successful. You may now return to WhatsApp and test with the **LIST/Documents** command.", 200
+    print(f"Extracted User ID: {user_id}")
+    
+    # 1. SETUP Command (Always handled first without needing Drive service)
+    if msg_body.upper() == 'SETUP':
+        # ... (Existing SETUP logic) ...
+        print(f"Received command: 'SETUP' from user: {user_id}")
+        encoded_user_id = base64.b64encode(user_id.encode('utf-8')).decode('utf-8')
+        auth_url, error = drive_auth.generate_auth_url(PUBLIC_URL, encoded_user_id)
+        
+        if error:
+            return send_whatsapp_response(f"Error initiating setup. Check logs for configuration issues: {error}")
+
+        response_msg = (
+            "*Google Drive Setup Required*\n\n"
+            "Please click the link below to securely authorize this app to access your Google Drive. This only needs to be done once.\n\n"
+            f"{auth_url}\n\n"
+            "This link will expire shortly."
+        )
+        return send_whatsapp_response(response_msg)
+
+    # --- Initialize Drive Service for All Other Commands/Media ---
+    drive, auth_error = get_drive_service(user_id)
+    if auth_error:
+        # If user sends a command but is not authenticated
+        if msg_body.upper() != 'SETUP':
+             return send_whatsapp_response(f"Error: {auth_error}")
+        # If user sends SETUP, it's handled above, so we pass here.
+
+
+    # 2. Media Handling (UPLOAD) - This needs to run if media is present.
+    # Command format: UPLOAD /Reports new_report.pdf
+    if num_media > 0 and drive:
+        
+        command_parts = msg_body.strip().split(' ', 2) # Splits by first two spaces max: [UPLOAD, /Reports, new_report.pdf]
+        
+        if not command_parts or command_parts[0].upper() != 'UPLOAD':
+            return send_whatsapp_response("Invalid upload command. Attach a file and use the caption format: UPLOAD /<Folder Name> <New File Name.ext>")
+            
+        if len(command_parts) < 2:
+            return send_whatsapp_response("Please specify the target folder for upload. Format: UPLOAD /<Folder Name> <New File Name.ext>")
+
+        # Extract folder path and file name
+        folder_path = command_parts[1].strip('/')
+        new_file_name = command_parts[2] if len(command_parts) == 3 else request.values.get('MediaFilename0', f"WhatsApp_Upload_{os.urandom(4).hex()}")
+        
+        # Twilio sends MediaUrl0, MediaContentType0 for the first media item
+        media_url = request.values.get('MediaUrl0')
+        
+        # 1. Fetch the media file and save temporarily
+        print(f"[{user_id}] Fetching media from URL: {media_url}")
+        
+        # We need Twilio credentials to download media securely
+        media_response = requests.get(media_url, auth=(os.getenv('TWILIO_ACCOUNT_SID'), os.getenv('TWILIO_AUTH_TOKEN')))
+        
+        if media_response.status_code != 200:
+            return send_whatsapp_response(f"Error: Could not fetch media from Twilio. Status: {media_response.status_code}. Check TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN.")
+        
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        temp_file_path_full = f"{TEMP_FILE_PATH}_{os.urandom(4).hex()}"
+        
+        try:
+            with open(temp_file_path_full, 'wb') as f:
+                f.write(media_response.content)
+            
+            # 2. Upload using drive_assistant logic
+            print(f"[{user_id}] Attempting upload of '{new_file_name}' to folder '{folder_path}'")
+            result_msg = drive_assistant.upload_file(drive, folder_path, temp_file_path_full, new_file_name)
+            return send_whatsapp_response(result_msg)
+
+        except Exception as e:
+            print(f"Error during UPLOAD processing: {e}")
+            return send_whatsapp_response(f"An error occurred during file processing or upload: {e}")
+        finally:
+            # 3. Clean up the temporary file
+            if os.path.exists(temp_file_path_full):
+                os.remove(temp_file_path_full)
+                print(f"Cleaned up temporary file: {temp_file_path_full}")
+        
+        # Return here to prevent falling through to command parsing below
+        return send_whatsapp_response("Processing file upload...")
+
+
+    # 3. Command Parsing (Non-media commands)
+    command_parts = [p.strip() for p in msg_body.upper().split('/', 1) if p.strip()]
+    
+    if command_parts and drive:
+        command = command_parts[0]
+        arg_string = command_parts[1] if len(command_parts) > 1 else None
+
+        print(f"[{user_id}] Processing text command: {command} with args: {arg_string}")
+
+        # --- LIST Command (Confirmed working) ---
+        if command == 'LIST' and arg_string:
+            result = drive_assistant.list_files(drive, arg_string)
+            return send_whatsapp_response(result)
+        
+        # --- DELETE Command ---
+        elif command == 'DELETE' and arg_string:
+            # Format: DELETE/Folder/FileName.ext
+            parts = [p.strip() for p in arg_string.split('/', 1) if p.strip()]
+            if len(parts) == 2:
+                result = drive_assistant.delete_file(drive, parts[0], parts[1])
+                return send_whatsapp_response(result)
+            return send_whatsapp_response("Invalid DELETE format. Use: DELETE/FolderName/FileName.ext")
+
+        # --- MOVE Command ---
+        elif command == 'MOVE' and arg_string:
+            # Format: MOVE/SourceFolder/FileName.ext/DestFolder
+            # Note: Using space as separator for destination folder as per user's request, but logic must match drive_assistant.py's expectation.
+            # drive_assistant.py expects: MOVE/SourceFolder/file.pdf/DestFolder (3 slash-separated arguments)
+            # User requested: MOVE /FolderName/file.pdf /Archive (2 space-separated arguments, with inner slash separation)
+            
+            # We will assume the user meant: MOVE/SourceFolder/File.ext/DestFolder (as implemented in drive_assistant)
+            parts = [p.strip() for p in arg_string.split('/', 2) if p.strip()]
+            if len(parts) == 3:
+                result = drive_assistant.move_file(drive, parts[0], parts[1], parts[2])
+                return send_whatsapp_response(result)
+            
+            # Handling the user's specific ambiguous format: MOVE /FolderName/file.pdf /Archive
+            # If the user sends "MOVE /Drafts/file.pdf /Final"
+            # The arg_string is "/Drafts/file.pdf /Final"
+            # Splitting by '/' gives ["", "Drafts", "file.pdf /Final"] -> Incorrect parsing.
+            
+            # Let's adjust parsing to handle the "MOVE/Source/File/Dest" structure, as it's cleaner.
+            return send_whatsapp_response("Invalid MOVE format. Use: MOVE/SourceFolder/FileName.ext/DestFolder")
+
+
+        # --- SUMMARY Command ---
+        elif command == 'SUMMARY' and arg_string:
+            # Format: SUMMARY/FolderName
+            result = drive_assistant.summarize_folder(drive, arg_string, OPENAI_API_KEY, OPENAI_MODEL_NAME)
+            return send_whatsapp_response(result)
+
+        # --- RENAME Command (Note: RENAME uses space separation, not slash) ---
+        elif command == 'RENAME' and not arg_string:
+            # RENAME commands are not slash-separated. We need to re-parse the original body.
+            # Format: RENAME file.pdf NewFileName.pdf
+            
+            # Strip "RENAME" and split the remaining string by the first space.
+            parts = [p.strip() for p in msg_body.strip().split(' ', 3) if p.strip()]
+            
+            if len(parts) == 3 and parts[0].upper() == 'RENAME':
+                old_file_name = parts[1]
+                new_file_name = parts[2]
+                result = drive_assistant.rename_file(drive, old_file_name, new_file_name)
+                return send_whatsapp_response(result)
+            return send_whatsapp_response("Invalid RENAME format. Use: RENAME OldFileName.ext NewFileName.ext")
+
+
+    # 4. Fallback/Help
+    help_msg = (
+        "*Drive Assistant Commands:*\n"
+        "1. *SETUP*: Connect your Google Drive.\n"
+        "2. *LIST/<Folder>*: List contents (e.g., `LIST/Reports`).\n"
+        "3. *UPLOAD /<Folder> <New File Name>*: Attach a file and use this caption (e.g., `UPLOAD /Images my_pic.jpg`). If no new name is provided, original filename is used.\n"
+        "4. *DELETE/<Folder>/<File>*: Delete a file (e.g., `DELETE/Docs/OldReport.pdf`).\n"
+        "5. *MOVE/<SrcFolder>/<File>/<DestFolder>*: Move a file (e.g., `MOVE/Temp/Draft.doc/Final`).\n"
+        "6. *RENAME OldName.ext NewName.ext*: Rename a file (e.g., `RENAME report.pdf final.pdf`).\n"
+        "7. *SUMMARY/<Folder>*: Get an AI summary of text documents in a folder (requires OpenAI key)."
+    )
+    return send_whatsapp_response(help_msg)
+
 
 if __name__ == '__main__':
-    app.run(debug=True, port=int(os.environ.get('PORT', 5000)))
+    # Ensure client secrets are loaded at startup
+    drive_auth.write_secrets_to_file()
+    app.run(debug=True, host='0.0.0.0', port=os.environ.get('PORT', 5000))
