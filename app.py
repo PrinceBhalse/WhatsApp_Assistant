@@ -215,7 +215,14 @@ def whatsapp_message():
             # Format: SUMMARY/FolderName
             try:
                 # Call the summary logic
-                result_msg = drive_assistant.summarize_folder(drive, arg_string, OPENAI_API_KEY, OPENAI_MODEL_NAME)
+                summary_text = drive_assistant.summarize_folder(drive, arg_string, OPENAI_API_KEY, OPENAI_MODEL_NAME)
+                
+                # FINAL SANITIZATION STEP: Ensure text is clean ASCII for TwiML
+                # This is the last resort to eliminate smart quotes or odd characters
+                safe_text = summary_text.encode('ascii', 'ignore').decode('ascii')
+                
+                result_msg = safe_text
+
             except Exception as e:
                 # Catch any error during summary generation or API call
                 print(f"Error during SUMMARY execution: {e}")
