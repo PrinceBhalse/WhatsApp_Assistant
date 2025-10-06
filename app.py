@@ -166,13 +166,11 @@ def whatsapp_message():
             print(f"[{user_id}] Processing RENAME command: from '{old_file_name}' to '{new_file_name}'")
             
             try:
-                # The returned success/error message from rename_file is now guaranteed to be captured
                 result_msg = drive_assistant.rename_file(drive, old_file_name, new_file_name)
             except Exception as e:
                 print(f"Error during RENAME execution: {e}")
                 result_msg = f"❌ An error occurred during rename: {e}"
             
-        # *** Guaranteed Response for RENAME block ***
         return send_whatsapp_response(result_msg)
 
 
@@ -199,17 +197,30 @@ def whatsapp_message():
 
         # --- MOVE Command ---
         elif command == 'MOVE' and arg_string:
+            # Format: MOVE/SourceFolder/FileName.ext/DestFolder
             parts = [p.strip() for p in arg_string.split('/', 2) if p.strip()]
+            
+            # Initialization and processing ensures a response is set in result_msg
             if len(parts) == 3:
-                result_msg = drive_assistant.move_file(drive, parts[0], parts[1], parts[2])
+                try:
+                    result_msg = drive_assistant.move_file(drive, parts[0], parts[1], parts[2])
+                except Exception as e:
+                    print(f"Error during MOVE execution: {e}")
+                    result_msg = f"❌ An error occurred during move: {e}"
             else:
                 result_msg = "Invalid MOVE format. Use: MOVE/SourceFolder/FileName.ext/DestFolder"
 
 
         # --- SUMMARY Command ---
         elif command == 'SUMMARY' and arg_string:
-            result_msg = drive_assistant.summarize_folder(drive, arg_string, OPENAI_API_KEY, OPENAI_MODEL_NAME)
-        
+            # Format: SUMMARY/FolderName
+            try:
+                result_msg = drive_assistant.summarize_folder(drive, arg_string, OPENAI_API_KEY, OPENAI_MODEL_NAME)
+            except Exception as e:
+                print(f"Error during SUMMARY execution: {e}")
+                result_msg = f"❌ An error occurred during summary generation: {e}"
+
+        # If any slash command was executed, return the result
         if result_msg:
             return send_whatsapp_response(result_msg)
 
