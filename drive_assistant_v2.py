@@ -2,363 +2,367 @@ import os
 import io
 import requests
 import json
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.errors import HttpError
-# Note: Ensure the 'openai' library is installed and OPENAI_API_KEY is set for SUMMARY
-# from openai import OpenAI 
-# Due to sandbox limitations, we must assume OpenAI is imported/available if needed.
-try:
-    from openai import OpenAI
-except ImportError:
-    class OpenAI:
-        def __init__(self, *args, **kwargs):
-            raise NotImplementedError("OpenAI library not available. Cannot use SUMMARY command.")
-        
+from openai import OpenAI
+from google.oauth2.credentials import Credentials
 
-# --- Utility: Drive API Helper Functions (No changes needed here, they are stable) ---
+# --- Helper Functions ---
 
-def get_folder_id(service, folder_path):
+def get_folder_id(drive_service, folder_path):
     """
-    Finds the ID of a folder given its path (e.g., 'Reports/Q3').
-    Assumes path is relative to the user's root Drive.
-    Returns folder ID or None.
+    Finds the ID of the folder based on its path (e.g., 'Reports/Q3/2025').
+    Returns the folder ID or None if not found.
     """
-    folder_names = folder_path.strip('/').split('/')
-    parent_id = 'root'
-    
+    current_parent_id = 'root'  # Start from the root of Google Drive
+
+    # Split the path, removing any leading/trailing slashes
+    folder_names = [name.strip() for name in folder_path.split('/') if name.strip()]
+
+    if not folder_names:
+        return 'root' # If path is empty, return root
+
     for folder_name in folder_names:
-        if not folder_name: continue # Skip empty strings from split/strip
-
+        # Search for the current folder name within the current parent ID
         query = (
-            f"name='{folder_name}' and "
-            f"mimeType='application/vnd.google-apps.folder' and "
-            f"'{parent_id}' in parents and "
-            "trashed=false"
+            f"'{current_parent_id}' in parents and "
+            f"name = '{folder_name}' and "
+            f"mimeType = 'application/vnd.google-apps.folder' and "
+            "trashed = false"
         )
-        
         try:
-            response = service.files().list(
+            results = drive_service.files().list(
                 q=query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name)',
-                pageSize=1
+                fields="files(id, name)",
+                spaces='drive'
             ).execute()
-        except HttpError as error:
-            print(f"Error listing files in get_folder_id: {error}")
-            return None
-
-        files = response.get('files', [])
-        if files:
-            parent_id = files[0]['id']
-        else:
-            return None 
             
-    return parent_id
+            items = results.get('files', [])
+            if not items:
+                print(f"Folder not found: {folder_name} inside parent ID: {current_parent_id}")
+                return None  # Path component not found
 
+            # Found the folder, update the parent ID for the next iteration
+            current_parent_id = items[0]['id']
 
-def get_file_by_name(service, name, parent_id='root'):
+        except HttpError as error:
+            print(f"An error occurred while searching for folder: {error}")
+            return None
+    
+    # After iterating through all parts, the last current_parent_id is the target folder ID
+    return current_parent_id
+
+def get_file_by_name(drive_service, folder_name, file_name):
     """
-    Finds a file by name in a specific folder (parent_id).
-    Returns file metadata or None.
+    Searches for a specific file name inside a specific folder.
+    Returns the file ID or None.
     """
+    folder_id = get_folder_id(drive_service, folder_name)
+
+    if not folder_id:
+        return None, f"Folder '{folder_name}' not found."
+
     query = (
-        f"name='{name}' and "
-        f"'{parent_id}' in parents and "
-        "trashed=false"
+        f"'{folder_id}' in parents and "
+        f"name = '{file_name}' and "
+        "trashed = false"
     )
     
     try:
-        response = service.files().list(
+        results = drive_service.files().list(
             q=query,
-            spaces='drive',
-            fields='nextPageToken, files(id, name, mimeType)',
-            pageSize=1
+            fields="files(id, name)",
+            spaces='drive'
         ).execute()
-    except HttpError as error:
-        print(f"Error listing file in get_file_by_name: {error}")
-        return None
-    
-    files = response.get('files', [])
-    return files[0] if files else None
 
-def get_file_by_name_anywhere(service, name):
+        items = results.get('files', [])
+        if not items:
+            return None, f"File '{file_name}' not found in folder '{folder_name}'."
+        
+        return items[0]['id'], None # Return the file ID and no error
+
+    except HttpError as error:
+        return None, f"An error occurred while searching for file: {error}"
+
+
+def get_file_by_name_anywhere(drive_service, file_name):
     """
-    Finds a file by name anywhere in the Drive.
-    Returns file metadata or None. (Used for RENAME).
+    Searches for a specific file name anywhere in the user's drive (used for RENAME).
+    Returns the file ID or None.
     """
+    # Note: Using the name field, not in a specific folder
     query = (
-        f"name='{name}' and "
-        "trashed=false"
+        f"name = '{file_name}' and "
+        "trashed = false"
     )
     
     try:
-        response = service.files().list(
+        results = drive_service.files().list(
             q=query,
-            spaces='drive',
-            fields='files(id, name, parents, mimeType)',
-            pageSize=1
+            fields="files(id, name)",
+            spaces='drive'
         ).execute()
+
+        items = results.get('files', [])
+        if not items:
+            return None, f"File '{file_name}' not found in your Drive."
+        
+        # Return the first matching file ID
+        return items[0]['id'], None
+
     except HttpError as error:
-        print(f"Error listing file in get_file_by_name_anywhere: {error}")
-        return None
-    
-    files = response.get('files', [])
-    return files[0] if files else None
+        return None, f"An error occurred while searching for file: {error}"
 
 
 # --- Command Implementations ---
 
-def list_files(service, folder_path):
+def list_files(drive_service, folder_path):
     """
-    Lists files in a given folder path.
-    Command: LIST /FolderName
+    Lists the files in the specified folder path.
+    Returns a formatted string message.
     """
-    folder_id = get_folder_id(service, folder_path)
+    folder_id = get_folder_id(drive_service, folder_path)
+
     if not folder_id:
-        return f"❌ Folder not found: /{folder_path}"
+        return f"❌ Folder '{folder_path}' not found."
 
     query = (
         f"'{folder_id}' in parents and "
-        "trashed=false"
+        "trashed = false"
     )
     
     try:
-        response = service.files().list(
+        results = drive_service.files().list(
             q=query,
+            fields="files(id, name, mimeType, modifiedTime)",
             spaces='drive',
-            fields='files(name, mimeType, size)',
-            pageSize=20 # Limit to 20 files for a clean WhatsApp list
+            pageSize=50 # Limit to 50 items for readability in WhatsApp
         ).execute()
 
-        files = response.get('files', [])
+        items = results.get('files', [])
+
+        if not items:
+            return f"📁 Folder '/{folder_path}' is empty."
+
+        output = f"📂 *Contents of /{folder_path}* (up to 50 items):\n"
         
-        if not files:
-            return f"✅ Folder /{folder_path} is empty."
-        
-        output = [f"📁 *Files in /{folder_path}* 📁"]
-        
-        for file in files:
-            name = file.get('name')
-            mime_type = file.get('mimeType')
+        for item in items:
+            is_folder = item['mimeType'] == 'application/vnd.google-apps.folder'
+            icon = '📁' if is_folder else '📄'
             
-            icon = '📄'
-            if mime_type == 'application/vnd.google-apps.folder':
-                icon = '🗂️'
-            elif mime_type.startswith('image/'):
-                icon = '🖼️'
-            elif mime_type == 'application/pdf':
-                icon = '📕'
-                
-            output.append(f"{icon} {name}")
+            # Extract and format the modification date (Drive API returns ISO 8601)
+            mod_time = item['modifiedTime'][:10] 
             
-        return "\n".join(output)
+            output += f"{icon} {item['name']} ({mod_time})\n"
+            
+        return output
 
     except HttpError as error:
-        return f"❌ An error occurred while listing files: {error}"
+        return f"❌ An error occurred: {error}"
 
 
-def upload_file(service, folder_path, local_file_path, drive_file_name):
+def upload_file(drive_service, folder_path, temp_file_path_full, drive_file_name):
     """
-    Uploads a local file to the specified Drive folder.
-    Command: UPLOAD /FolderName NewFileName.ext
+    Uploads a file from a temporary local path to the specified Google Drive folder.
     """
-    folder_id = get_folder_id(service, folder_path) 
+    folder_id = get_folder_id(drive_service, folder_path)
+    
     if not folder_id:
-        return f"❌ Upload failed: Target folder not found: /{folder_path}. Remember to create the folder first."
+        return f"❌ Upload failed: Destination folder '{folder_path}' not found."
 
+    file_metadata = {
+        'name': drive_file_name,
+        'parents': [folder_id]
+    }
+    
+    # Determine the MIME type (Drive often guesses correctly, but we need the path)
+    
+    from mimetypes import MimeTypes
+    mime = MimeTypes()
+    guessed_mime_type = mime.guess_type(drive_file_name)[0] or 'application/octet-stream'
+
+    media = None
     try:
-        # Determine MIME type based on file extension
-        mime_type = 'application/octet-stream' # Default
-        if drive_file_name.endswith('.jpg') or drive_file_name.endswith('.jpeg'):
-             mime_type = 'image/jpeg'
-        elif drive_file_name.endswith('.png'):
-             mime_type = 'image/png'
-        elif drive_file_name.endswith('.pdf'):
-             mime_type = 'application/pdf'
-        
-        file_metadata = {
-            'name': drive_file_name,
-            'parents': [folder_id]
-        }
-        
-        media = MediaFileUpload(local_file_path, mimetype=mime_type, resumable=True)
-        
-        file = service.files().create(
+        media = drive_service.files().create(
             body=file_metadata,
-            media_body=media,
-            fields='id, name'
+            media_body=temp_file_path_full,
+            media_mime_type=guessed_mime_type,
+            fields='id'
         ).execute()
-        
-        # --- CRITICAL CHANGE: Ensure simple string return ---
-        return f"✅ Successfully uploaded '{file.get('name')}' to /{folder_path}." 
+
+        return f"✅ Successfully uploaded '{drive_file_name}' to /{folder_path}."
 
     except HttpError as error:
-        # Return HTTP error specifically
-        return f"❌ Upload HTTP error: {error}"
+        print(f"Upload failed: {error}")
+        return f"❌ Upload failed due to a Drive API error. Details: {error}"
     except Exception as e:
-        # Return general exception
-        return f"❌ Upload error: {e}"
+        print(f"Unexpected upload error: {e}")
+        return f"❌ An unexpected error occurred during upload: {e}"
 
 
-def delete_file(service, folder_path, file_name):
+def delete_file(drive_service, folder_name, file_name):
     """
-    Moves a file to the trash.
-    Command: DELETE/FolderName/FileName.ext
+    Moves a file to trash.
     """
-    folder_id = get_folder_id(service, folder_path)
-    if not folder_id:
-        return f"❌ Delete failed: Folder not found: /{folder_path}"
-    
-    file_info = get_file_by_name(service, file_name, folder_id)
-    
-    if not file_info:
-        return f"❌ Delete failed: File '{file_name}' not found in /{folder_path}."
+    file_id, error_msg = get_file_by_name(drive_service, folder_name, file_name)
+
+    if error_msg:
+        return f"❌ Delete failed: {error_msg}"
         
     try:
-        service.files().update(
-            fileId=file_info['id'],
-            body={'trashed': True},
-            fields='id'
+        # Update the file's metadata to set 'trashed' to true
+        drive_service.files().update(
+            fileId=file_id, 
+            body={'trashed': True}
         ).execute()
         
         return f"🗑️ Successfully moved file '{file_name}' to trash."
+
     except HttpError as error:
-        return f"❌ Delete error: {error}"
-
-
-def move_file(service, src_folder, file_name, dest_folder):
+        return f"❌ Delete failed due to a Drive API error: {error}"
+        
+        
+def move_file(drive_service, source_folder, file_name, destination_folder):
     """
     Moves a file from the source folder to the destination folder.
-    Command: MOVE/SrcFolder/FileName.ext/DestFolder
     """
-    src_id = get_folder_id(service, src_folder)
-    dest_id = get_folder_id(service, dest_folder)
+    file_id, error_msg = get_file_by_name(drive_service, source_folder, file_name)
+
+    if error_msg:
+        return f"❌ Move failed: {error_msg}"
     
-    if not src_id:
-        return f"❌ Move failed: Source folder not found: /{src_folder}"
-    if not dest_id:
-        return f"❌ Move failed: Destination folder not found: /{dest_folder}"
-        
-    file_info = get_file_by_name(service, file_name, src_id)
-    if not file_info:
-        return f"❌ Move failed: File '{file_name}' not found in /{src_folder}."
-        
+    destination_folder_id = get_folder_id(drive_service, destination_folder)
+
+    if not destination_folder_id:
+        return f"❌ Move failed: Destination folder '{destination_folder}' not found."
+    
+    source_folder_id = get_folder_id(drive_service, source_folder)
+    
     try:
-        service.files().update(
-            fileId=file_info['id'],
-            addParents=dest_id,
-            removeParents=src_id,
+        # Atomically remove it from the source folder and add it to the destination folder
+        drive_service.files().update(
+            fileId=file_id,
+            addParents=destination_folder_id,
+            removeParents=source_folder_id,
             fields='id, parents'
         ).execute()
         
-        return f"➡️ Successfully moved '{file_name}' from /{src_folder} to /{dest_folder}."
+        return f"➡️ Successfully moved '{file_name}' from /{source_folder} to /{destination_folder}."
+        
     except HttpError as error:
-        return f"❌ Move error: {error}"
+        return f"❌ Move failed due to a Drive API error: {error}"
 
 
-def rename_file(service, old_name, new_name):
+def rename_file(drive_service, old_file_name, new_file_name):
     """
-    Renames a file. Searches entire Drive for the old file name.
-    Command: RENAME OldName.ext NewName.ext
+    Renames a file found anywhere in the user's Drive.
     """
-    file_info = get_file_by_name_anywhere(service, old_name)
-    
-    if not file_info:
-        return f"❌ Rename failed: File '{old_name}' not found in your Drive."
+    file_id, error_msg = get_file_by_name_anywhere(drive_service, old_file_name)
+
+    if error_msg:
+        return f"❌ Rename failed: {error_msg}"
         
     try:
-        service.files().update(
-            fileId=file_info['id'],
-            body={'name': new_name},
-            fields='id, name'
+        # Update the file's metadata to set the new name
+        drive_service.files().update(
+            fileId=file_id, 
+            body={'name': new_file_name}
         ).execute()
         
-        return f"✏️ Successfully renamed '{old_name}' to '{new_name}'."
+        return f"✏️ Successfully renamed '{old_file_name}' to '{new_file_name}'."
+
     except HttpError as error:
-        return f"❌ Rename error: {error}"
+        return f"❌ Rename failed due to a Drive API error: {error}"
 
 
-def summarize_folder(service, folder_path, openai_api_key, openai_model_name):
+def summarize_folder(drive_service, folder_path, openai_api_key, model_name):
     """
-    Summarizes content of text/document files in a folder using OpenAI.
-    Command: SUMMARY/FolderName
+    Downloads all text-based files in a folder, concatenates their content, and generates an AI summary.
     """
-    folder_id = get_folder_id(service, folder_path)
+    if not openai_api_key or openai_api_key == 'default-key':
+        return "⚠️ SUMMARY failed: OPENAI_API_KEY is missing or invalid. Set this environment variable to use AI features."
+        
+    folder_id = get_folder_id(drive_service, folder_path)
+
     if not folder_id:
-        return f"❌ Summary failed: Folder not found: /{folder_path}"
+        return f"❌ Folder '{folder_path}' not found."
 
-    if isinstance(OpenAI, NotImplementedError) or not openai_api_key or openai_api_key == 'default-key':
-        return "⚠️ Summary failed: OPENAI_API_KEY environment variable is not set or the library is unavailable."
-
+    # Search query: files inside the folder, not trashed, and NOT folders themselves.
     query = (
         f"'{folder_id}' in parents and "
-        "mimeType contains 'text/' and " 
-        "trashed=false"
+        f"mimeType != 'application/vnd.google-apps.folder' and "
+        "trashed = false"
     )
     
     try:
-        response = service.files().list(
+        results = drive_service.files().list(
             q=query,
+            fields="files(id, name, mimeType, size)",
             spaces='drive',
-            fields='files(id, name, mimeType)',
-            pageSize=10
+            pageSize=10 # Limit file processing to 10 files for performance
         ).execute()
-    except HttpError as error:
-        return f"❌ Error listing files for summary: {error}"
 
-    files = response.get('files', [])
-    if not files:
-        return f"✅ No text documents found in /{folder_path} to summarize."
+        items = results.get('files', [])
+
+        if not items:
+            return f"📂 Folder '/{folder_path}' contains no documents to summarize (or maximum 10 file limit exceeded)."
+
+        full_text = ""
+        file_count = 0
         
-    full_text = ""
-    
-    for file in files:
-        file_id = file['id']
-        file_name = file['name']
-        mime_type = file['mimeType']
-        
-        try:
-            if mime_type.startswith('text/'):
-                request = service.files().get_media(fileId=file_id)
-            else:
-                continue
-
-            fh = io.BytesIO()
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while done is False:
-                status, done = downloader.next_chunk()
-            
-            full_text += f"\n\n--- Start of {file_name} ---\n"
-            full_text += fh.getvalue().decode('utf-8')
-            full_text += f"\n--- End of {file_name} ---\n"
-            
-        except HttpError as error:
-            print(f"Warning: Could not download {file_name}. Error: {error}")
-            continue
-
-    if not full_text:
-        return "⚠️ Summary failed: Could not read content from any text file."
-
-    try:
+        # Initialize OpenAI Client
         client = OpenAI(api_key=openai_api_key)
-        
+
+        for item in items:
+            # Skip large files (e.g., > 1MB) for summary generation
+            if item.get('size') and int(item['size']) > 1048576: # 1MB limit
+                continue
+                
+            # Download file content
+            try:
+                # Get the file's content using its ID
+                request = drive_service.files().get_media(fileId=item['id'])
+                fh = io.BytesIO()
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while done is False:
+                    status, done = downloader.next_chunk()
+                
+                # IMPORTANT FIX: Decode with errors='ignore' to handle non-UTF8/binary content
+                # This prevents the UnicodeDecodeError if non-text files are present.
+                content = fh.getvalue().decode('utf-8', errors='ignore')
+
+                if content.strip():
+                    full_text += f"\n\n--- FILE: {item['name']} ---\n"
+                    full_text += content
+                    file_count += 1
+
+            except Exception as e:
+                print(f"Error downloading or processing file {item['name']}: {e}")
+                continue # Skip to the next file if an error occurs
+
+        if not full_text:
+            return f"⚠️ Could not extract any readable text from the documents in /{folder_path}."
+
+        # Send combined text to OpenAI for summary
         prompt = (
-            "You are a document summarizer. Read the following concatenated documents "
-            f"from the folder '{folder_path}'. Provide a concise, bulleted summary of the key findings, topics, or decisions, "
-            f"formatted strictly using Markdown bullet points (*)."
-            f"\n\n--- DOCUMENTS START ---\n{full_text}\n--- DOCUMENTS END ---\n"
+            "Summarize the following concatenated text from multiple documents. "
+            "Provide a concise, single-paragraph overview of the key themes and information. "
+            "Do not exceed 150 words. The content is:\n\n"
+            f"{full_text}"
         )
-        
+
         chat_completion = client.chat.completions.create(
-            model=openai_model_name,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}]
         )
-        
+
         summary = chat_completion.choices[0].message.content.strip()
         
-        return f"🤖 *AI Summary for /{folder_path}* 🤖\n\n{summary}"
+        return f"🤖 *AI Summary for /{folder_path}* ({file_count} documents analyzed):\n\n{summary}"
 
+    except HttpError as error:
+        return f"❌ An error occurred during Drive API call: {error}"
     except Exception as e:
-        return f"❌ AI summary error. Check OPENAI_API_KEY and service status: {e}"
+        # Catch network or OpenAI API errors
+        return f"❌ An external error occurred during SUMMARY (AI/Network): {e}"
