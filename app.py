@@ -155,12 +155,30 @@ def whatsapp_message():
                 os.remove(temp_file_path_full)
                 print(f"Cleaned up temporary file: {temp_file_path_full}")
         
-        # Return here to prevent falling through to command parsing below
-        # This line should technically be unreachable if 'try' or 'except' execute.
         return send_whatsapp_response("Processing file upload...")
 
 
     # 3. Command Parsing (Non-media commands)
+    
+    # Check for RENAME first, as it uses spaces and breaks the slash logic
+    if msg_body.upper().startswith('RENAME '):
+        # Format: RENAME OldFileName.ext NewFileName.ext
+        # We split by space, limit to 3 parts: RENAME, OldName, NewName
+        parts = [p.strip() for p in msg_body.strip().split(' ', 3) if p.strip()]
+        
+        # The command is the first part (RENAME), we need exactly two more arguments.
+        if len(parts) == 3:
+            old_file_name = parts[1]
+            new_file_name = parts[2]
+            print(f"[{user_id}] Processing RENAME command: from '{old_file_name}' to '{new_file_name}'")
+            result = drive_assistant.rename_file(drive, old_file_name, new_file_name)
+            return send_whatsapp_response(result)
+        
+        # If the number of parts is wrong, return an error message specific to RENAME
+        return send_whatsapp_response("Invalid RENAME format. Use: RENAME OldFileName.ext NewFileName.ext")
+
+
+    # Standard slash parsing for all remaining commands (LIST, DELETE, MOVE, SUMMARY)
     command_parts = msg_body.strip().upper().split('/', 1)
     command = command_parts[0]
     arg_string = command_parts[1] if len(command_parts) > 1 else None
@@ -168,7 +186,7 @@ def whatsapp_message():
     if drive:
         print(f"[{user_id}] Processing text command: {command} with args: {arg_string}")
 
-        # --- LIST Command (Working) ---
+        # --- LIST Command ---
         if command == 'LIST' and arg_string:
             result = drive_assistant.list_files(drive, arg_string)
             return send_whatsapp_response(result)
@@ -185,6 +203,8 @@ def whatsapp_message():
         # --- MOVE Command ---
         elif command == 'MOVE' and arg_string:
             # Format: MOVE/SourceFolder/FileName.ext/DestFolder
+            # Note: The split limit (2) ensures the filename part can contain slashes if needed, 
+            # though it should ideally not if it is just a filename. We are splitting the ArgString into 3 parts.
             parts = [p.strip() for p in arg_string.split('/', 2) if p.strip()]
             if len(parts) == 3:
                 result = drive_assistant.move_file(drive, parts[0], parts[1], parts[2])
@@ -197,19 +217,6 @@ def whatsapp_message():
             # Format: SUMMARY/FolderName
             result = drive_assistant.summarize_folder(drive, arg_string, OPENAI_API_KEY, OPENAI_MODEL_NAME)
             return send_whatsapp_response(result)
-
-        # --- RENAME Command (Note: RENAME uses space separation, not slash) ---
-        elif command == 'RENAME':
-            # Format: RENAME OldFileName.ext NewFileName.ext
-            # Re-parse the original body using spaces
-            parts = [p.strip() for p in msg_body.strip().split(' ', 3) if p.strip()]
-            
-            if len(parts) == 3 and parts[0].upper() == 'RENAME':
-                old_file_name = parts[1]
-                new_file_name = parts[2]
-                result = drive_assistant.rename_file(drive, old_file_name, new_file_name)
-                return send_whatsapp_response(result)
-            return send_whatsapp_response("Invalid RENAME format. Use: RENAME OldFileName.ext NewFileName.ext")
 
 
     # 4. Fallback/Help
