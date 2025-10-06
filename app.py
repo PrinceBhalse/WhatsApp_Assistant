@@ -1,13 +1,12 @@
 import os
 import json
 import base64
-import drive_auth # Assuming this handles the build_drive_service for pydrive2
-import drive_assistant # Your core drive logic
+import drive_auth # Authentication and service builder
+import drive_assistant_v2 as drive_assistant # New logic using native API
 import requests 
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from pydrive2.drive import GoogleDrive # Needed for type hinting/creation
-import io
+import re # For better command parsing
 
 app = Flask(__name__)
 
@@ -28,22 +27,10 @@ def send_whatsapp_response(msg=""):
     resp.message(msg)
     return str(resp)
 
-# --- Drive Service Builder (Assuming this is already working and returns a pydrive2 object) ---
+# --- Drive Service Builder (Assuming this is already working and returns a native API service) ---
 
 def get_drive_service(user_id):
-    """
-    Retrieves the authenticated GoogleDrive object (pydrive2) for the user.
-    Assumes drive_auth.build_drive_service is configured to return the
-    correct PyDrive2 object or raise an authentication error.
-    """
-    # NOTE: This function needs to align exactly with what your existing drive_auth.py returns.
-    # Based on our previous exchanges, I assume a function that returns the pydrive2.GoogleDrive object.
-    # If the current drive_auth.py only returns googleapiclient.discovery.build object,
-    # the integration with pydrive2 in drive_assistant.py is incorrect, but we proceed
-    # assuming the integration is handled within your existing, working files.
-    
-    # Placeholder call to your existing, working auth function:
-    # If your drive_auth.py returns a tuple (service, error_message):
+    """Retrieves the authenticated Google API Service object for the user."""
     service, auth_error = drive_auth.build_drive_service(user_id)
     return service, auth_error
 
@@ -62,7 +49,6 @@ def oauth_callback():
         user_id = base64.b64decode(encoded_user_id).decode('utf-8')
         print(f"Callback received for user: {user_id}. Attempting token exchange.")
         
-        # Using the existing working functions from your drive_auth.py
         credentials, error = drive_auth.exchange_code_for_token(code, PUBLIC_URL)
         
         if error:
@@ -96,15 +82,14 @@ def whatsapp_message():
         
     print(f"Extracted User ID: {user_id}")
     
-    # 1. SETUP Command (Always handled first without needing Drive service)
+    # 1. SETUP Command (Always handled first)
     if msg_body.upper() == 'SETUP':
-        # ... (Existing SETUP logic) ...
         print(f"Received command: 'SETUP' from user: {user_id}")
         encoded_user_id = base64.b64encode(user_id.encode('utf-8')).decode('utf-8')
         auth_url, error = drive_auth.generate_auth_url(PUBLIC_URL, encoded_user_id)
         
         if error:
-            return send_whatsapp_response(f"Error initiating setup. Check logs for configuration issues: {error}")
+            return send_whatsapp_response(f"Error initiating setup: {error}")
 
         response_msg = (
             "*Google Drive Setup Required*\n\n"
@@ -118,28 +103,26 @@ def whatsapp_message():
     drive, auth_error = get_drive_service(user_id)
     if auth_error:
         # If user sends a command but is not authenticated
-        if msg_body.upper() != 'SETUP':
-             return send_whatsapp_response(f"Error: {auth_error}")
-        # If user sends SETUP, it's handled above, so we pass here.
+        return send_whatsapp_response(f"Error: {auth_error}. Please send 'SETUP' to connect your Drive.")
 
 
-    # 2. Media Handling (UPLOAD) - This needs to run if media is present.
+    # 2. Media Handling (UPLOAD) - Runs if media is present AND command starts with UPLOAD
     # Command format: UPLOAD /Reports new_report.pdf
     if num_media > 0 and drive:
         
-        command_parts = msg_body.strip().split(' ', 2) # Splits by first two spaces max: [UPLOAD, /Reports, new_report.pdf]
+        command_match = re.match(r'UPLOAD\s+(/[^\s]+)(?:\s+(.+))?', msg_body.strip(), re.IGNORECASE)
         
-        if not command_parts or command_parts[0].upper() != 'UPLOAD':
-            return send_whatsapp_response("Invalid upload command. Attach a file and use the caption format: UPLOAD /<Folder Name> <New File Name.ext>")
+        if not command_match:
+            # If a file is attached but the caption doesn't look like UPLOAD
+            return send_whatsapp_response("File attached, but missing or invalid UPLOAD command. Use: UPLOAD /<Folder Name> <New File Name.ext>")
             
-        if len(command_parts) < 2:
-            return send_whatsapp_response("Please specify the target folder for upload. Format: UPLOAD /<Folder Name> <New File Name.ext>")
-
-        # Extract folder path and file name
-        folder_path = command_parts[1].strip('/')
-        new_file_name = command_parts[2] if len(command_parts) == 3 else request.values.get('MediaFilename0', f"WhatsApp_Upload_{os.urandom(4).hex()}")
+        folder_path = command_match.group(1).strip('/') # e.g., 'Reports'
+        new_file_name_input = command_match.group(2) # e.g., 'new_report.pdf'
         
-        # Twilio sends MediaUrl0, MediaContentType0 for the first media item
+        # Get original file name from Twilio, used if user doesn't specify a new name
+        default_file_name = request.values.get('MediaFilename0', f"WhatsApp_Upload_{os.urandom(4).hex()}")
+        drive_file_name = new_file_name_input or default_file_name
+        
         media_url = request.values.get('MediaUrl0')
         
         # 1. Fetch the media file and save temporarily
@@ -159,8 +142,8 @@ def whatsapp_message():
                 f.write(media_response.content)
             
             # 2. Upload using drive_assistant logic
-            print(f"[{user_id}] Attempting upload of '{new_file_name}' to folder '{folder_path}'")
-            result_msg = drive_assistant.upload_file(drive, folder_path, temp_file_path_full, new_file_name)
+            print(f"[{user_id}] Attempting upload of '{drive_file_name}' to folder '{folder_path}'")
+            result_msg = drive_assistant.upload_file(drive, folder_path, temp_file_path_full, drive_file_name)
             return send_whatsapp_response(result_msg)
 
         except Exception as e:
@@ -173,19 +156,19 @@ def whatsapp_message():
                 print(f"Cleaned up temporary file: {temp_file_path_full}")
         
         # Return here to prevent falling through to command parsing below
+        # This line should technically be unreachable if 'try' or 'except' execute.
         return send_whatsapp_response("Processing file upload...")
 
 
     # 3. Command Parsing (Non-media commands)
-    command_parts = [p.strip() for p in msg_body.upper().split('/', 1) if p.strip()]
-    
-    if command_parts and drive:
-        command = command_parts[0]
-        arg_string = command_parts[1] if len(command_parts) > 1 else None
+    command_parts = msg_body.strip().upper().split('/', 1)
+    command = command_parts[0]
+    arg_string = command_parts[1] if len(command_parts) > 1 else None
 
+    if drive:
         print(f"[{user_id}] Processing text command: {command} with args: {arg_string}")
 
-        # --- LIST Command (Confirmed working) ---
+        # --- LIST Command (Working) ---
         if command == 'LIST' and arg_string:
             result = drive_assistant.list_files(drive, arg_string)
             return send_whatsapp_response(result)
@@ -202,22 +185,10 @@ def whatsapp_message():
         # --- MOVE Command ---
         elif command == 'MOVE' and arg_string:
             # Format: MOVE/SourceFolder/FileName.ext/DestFolder
-            # Note: Using space as separator for destination folder as per user's request, but logic must match drive_assistant.py's expectation.
-            # drive_assistant.py expects: MOVE/SourceFolder/file.pdf/DestFolder (3 slash-separated arguments)
-            # User requested: MOVE /FolderName/file.pdf /Archive (2 space-separated arguments, with inner slash separation)
-            
-            # We will assume the user meant: MOVE/SourceFolder/File.ext/DestFolder (as implemented in drive_assistant)
             parts = [p.strip() for p in arg_string.split('/', 2) if p.strip()]
             if len(parts) == 3:
                 result = drive_assistant.move_file(drive, parts[0], parts[1], parts[2])
                 return send_whatsapp_response(result)
-            
-            # Handling the user's specific ambiguous format: MOVE /FolderName/file.pdf /Archive
-            # If the user sends "MOVE /Drafts/file.pdf /Final"
-            # The arg_string is "/Drafts/file.pdf /Final"
-            # Splitting by '/' gives ["", "Drafts", "file.pdf /Final"] -> Incorrect parsing.
-            
-            # Let's adjust parsing to handle the "MOVE/Source/File/Dest" structure, as it's cleaner.
             return send_whatsapp_response("Invalid MOVE format. Use: MOVE/SourceFolder/FileName.ext/DestFolder")
 
 
@@ -228,11 +199,9 @@ def whatsapp_message():
             return send_whatsapp_response(result)
 
         # --- RENAME Command (Note: RENAME uses space separation, not slash) ---
-        elif command == 'RENAME' and not arg_string:
-            # RENAME commands are not slash-separated. We need to re-parse the original body.
-            # Format: RENAME file.pdf NewFileName.pdf
-            
-            # Strip "RENAME" and split the remaining string by the first space.
+        elif command == 'RENAME':
+            # Format: RENAME OldFileName.ext NewFileName.ext
+            # Re-parse the original body using spaces
             parts = [p.strip() for p in msg_body.strip().split(' ', 3) if p.strip()]
             
             if len(parts) == 3 and parts[0].upper() == 'RENAME':
@@ -252,7 +221,7 @@ def whatsapp_message():
         "4. *DELETE/<Folder>/<File>*: Delete a file (e.g., `DELETE/Docs/OldReport.pdf`).\n"
         "5. *MOVE/<SrcFolder>/<File>/<DestFolder>*: Move a file (e.g., `MOVE/Temp/Draft.doc/Final`).\n"
         "6. *RENAME OldName.ext NewName.ext*: Rename a file (e.g., `RENAME report.pdf final.pdf`).\n"
-        "7. *SUMMARY/<Folder>*: Get an AI summary of text documents in a folder (requires OpenAI key)."
+        "7. *SUMMARY/<Folder>*: Get an AI summary of text documents in a folder (requires OPENAI_API_KEY)."
     )
     return send_whatsapp_response(help_msg)
 
