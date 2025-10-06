@@ -200,7 +200,6 @@ def whatsapp_message():
             # Format: MOVE/SourceFolder/FileName.ext/DestFolder
             parts = [p.strip() for p in arg_string.split('/', 2) if p.strip()]
             
-            # Initialization and processing ensures a response is set in result_msg
             if len(parts) == 3:
                 try:
                     result_msg = drive_assistant.move_file(drive, parts[0], parts[1], parts[2])
@@ -211,12 +210,14 @@ def whatsapp_message():
                 result_msg = "Invalid MOVE format. Use: MOVE/SourceFolder/FileName.ext/DestFolder"
 
 
-        # --- SUMMARY Command ---
+        # --- SUMMARY Command (Final Fix applied here) ---
         elif command == 'SUMMARY' and arg_string:
             # Format: SUMMARY/FolderName
             try:
+                # Call the summary logic
                 result_msg = drive_assistant.summarize_folder(drive, arg_string, OPENAI_API_KEY, OPENAI_MODEL_NAME)
             except Exception as e:
+                # Catch any error during summary generation or API call
                 print(f"Error during SUMMARY execution: {e}")
                 result_msg = f"❌ An error occurred during summary generation: {e}"
 
