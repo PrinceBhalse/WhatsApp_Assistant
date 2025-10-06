@@ -2,26 +2,19 @@ import os
 import json
 import firebase_admin
 from firebase_admin import firestore
-# Changed import name to reflect the need for the base Flow class
 from google_auth_oauthlib.flow import Flow 
 from google.auth.transport.requests import Request
 from urllib.parse import urlparse
 
 # --- Configuration ---
-# UPDATED SCOPE: Use the full 'drive' scope, as the user is granting it anyway and
-# the broader scope is necessary for listing files (not just metadata).
 DRIVE_SCOPE = ['https://www.googleapis.com/auth/drive'] 
 
 # Global variables (Initialized later)
 db = None
-auth = None
 client_secrets_json_data = {}
 
 # --- Firestore Paths and Secrets ---
-# App ID is globally provided by the environment
 app_id = os.getenv('__app_id', 'default-app-id') 
-
-# Directory where the client_secrets.json file will be temporarily written
 TEMP_DIR = os.getenv('TEMP_DIR', '/tmp') 
 SECRETS_FILE_PATH = os.path.join(TEMP_DIR, 'client_secrets.json')
 
@@ -30,19 +23,17 @@ SECRETS_FILE_PATH = os.path.join(TEMP_DIR, 'client_secrets.json')
 def initialize_firestore_client():
     """Initializes the Firestore client and attempts to authenticate."""
     global db
+    if db is not None:
+        return True
+        
     try:
         if not firebase_admin._apps:
-            # We assume firebaseConfig is passed as a string or available in the env
             firebase_config_str = os.getenv('__firebase_config')
             if not firebase_config_str:
                 print("FATAL: Firebase config not found in __firebase_config environment variable.")
-                # We return False but allow the app to start so the user sees the message
                 return False
             
-            # The Admin SDK expects a dict, which the env var provides as a JSON string
             firebase_config = json.loads(firebase_config_str)
-            
-            # Initialize the Firebase App
             cred = firebase_admin.credentials.Certificate(firebase_config)
             firebase_admin.initialize_app(cred)
 
@@ -54,24 +45,30 @@ def initialize_firestore_client():
         return False
 
 def get_db():
-    """Returns the initialized Firestore client."""
+    """Returns the initialized Firestore client, ensuring initialization first."""
     if db is None:
         initialize_firestore_client()
     return db
 
 def get_token_doc_ref(user_id):
     """Gets the Firestore Document Reference for a user's token."""
-    # Private data path: /artifacts/{appId}/users/{userId}/tokens/{tokenDoc}
-    return get_db().document(f'artifacts/{app_id}/users/{user_id}/tokens/drive_token')
+    # Ensure Firestore is initialized before creating references
+    if get_db():
+        # Private data path: /artifacts/{appId}/users/{userId}/tokens/{tokenDoc}
+        return db.document(f'artifacts/{app_id}/users/{user_id}/tokens/drive_token')
+    return None
 
 def store_credentials(user_id, credentials):
     """Stores the Google Drive credentials (refresh token) for a user."""
+    doc_ref = get_token_doc_ref(user_id)
+    if not doc_ref:
+        print(f"Error: Could not get Firestore document reference for storing credentials for user: {user_id}")
+        return
+
     try:
-        doc_ref = get_token_doc_ref(user_id)
         # ONLY store if a refresh_token is present
         if not credentials.refresh_token:
             print(f"Skipping credential storage for {user_id}: No refresh token received.")
-            # If no refresh token, we skip storage but don't error out. The error is returned to the user via the Flask route.
             return 
             
         token_data = {
@@ -88,14 +85,23 @@ def store_credentials(user_id, credentials):
 
 def load_credentials(user_id):
     """Loads and rebuilds Google Drive credentials for a user."""
+    doc_ref = get_token_doc_ref(user_id)
+    if not doc_ref:
+        print(f"Error: Could not get Firestore document reference for loading credentials for user: {user_id}. DB may be uninitialized.")
+        return None
+
     try:
-        doc_ref = get_token_doc_ref(user_id)
+        print(f"Attempting to load token from path: {doc_ref.path}")
         doc = doc_ref.get()
         if doc.exists:
             token_data = doc.to_dict()
+            print(f"Token loaded successfully for user: {user_id}. Scopes: {token_data.get('scopes')}")
             return token_data
+        
+        print(f"No token found for user: {user_id} at path: {doc_ref.path}")
         return None
     except Exception as e:
+        # This will catch the SERVICE_DISABLED (403) errors during token loading
         print(f"Error loading credentials for {user_id}: {e}")
         return None
 
@@ -119,7 +125,6 @@ def write_secrets_to_file():
             print(f"Successfully wrote secrets content to {SECRETS_FILE_PATH}")
             return True
         except json.JSONDecodeError as e:
-            # This handles the case where the JSON is malformed
             print(f"FATAL Error parsing GOOGLE_DRIVE_SECRETS_CONTENT: {e}")
             return False
     else:
@@ -131,12 +136,10 @@ def write_secrets_to_file():
 def generate_auth_url(public_url):
     """Generates the Google authorization URL."""
     
-    # 1. Ensure secrets are loaded and written to file
     if not write_secrets_to_file():
         return None, "Error: Invalid or missing Google Drive secrets configuration."
 
     try:
-        # 2. Determine Client Type and set flow arguments
         is_web_app = 'web' in client_secrets_json_data
 
         flow = Flow.from_client_secrets_file(
@@ -144,21 +147,18 @@ def generate_auth_url(public_url):
             DRIVE_SCOPE
         )
 
-        # 3. Conditionally set the redirect_uri on the flow object
         redirect_uri = public_url + "/oauth/callback"
         flow.redirect_uri = redirect_uri
         
-        # 4. Generate the URL
         if not is_web_app:
             print("WARNING: Client type detected as 'installed'. Authorization will likely fail on Google's side.")
 
         auth_url, _ = flow.authorization_url(
             access_type='offline',
             include_granted_scopes='true',
-            prompt='consent' # <-- FORCING CONSENT TO ENSURE REFRESH TOKEN IS ISSUED
+            prompt='consent' 
         )
 
-        # 5. Success
         return auth_url, None
 
     except Exception as e:
@@ -173,16 +173,14 @@ def exchange_code_for_token(auth_code, public_url):
         return None, "Error: Invalid or missing Google Drive secrets configuration."
 
     try:
-        is_web_app = 'web' in client_secrets_json_data
         redirect_uri = public_url + "/oauth/callback"
 
         flow = Flow.from_client_secrets_file(
             SECRETS_FILE_PATH, 
             DRIVE_SCOPE
         )
-        flow.redirect_uri = redirect_uri # Set redirect_uri on flow object
+        flow.redirect_uri = redirect_uri
 
-        # Exchange the code.
         flow.fetch_token(code=auth_code)
             
         return flow.credentials, None
@@ -191,7 +189,7 @@ def exchange_code_for_token(auth_code, public_url):
         print(f"Error exchanging code for token: {e}")
         return None, f"Error exchanging code for token: {e}"
 
-# --- Utility for Drive API Calls (unchanged) ---
+# --- Utility for Drive API Calls ---
 
 def build_drive_service(user_id):
     """Builds a credentials object using the stored refresh token."""
@@ -203,7 +201,6 @@ def build_drive_service(user_id):
         return None, "Failed to load client configuration."
         
     try:
-        # We need to extract the client configuration based on the type
         if 'web' in client_secrets_json_data:
             client_config = client_secrets_json_data['web']
         elif 'installed' in client_secrets_json_data:
@@ -211,6 +208,9 @@ def build_drive_service(user_id):
         else:
             return None, "Invalid Google Drive secrets file type."
 
+        # Import the build function here to avoid circular imports and only if necessary
+        from googleapiclient.discovery import build
+        
         # Rebuild Credentials object from stored data and client config
         creds = Request().make_authorization_credentials(
             token=None, 
@@ -221,15 +221,13 @@ def build_drive_service(user_id):
             scopes=token_data.get('scopes')
         )
         
-        return creds, None
+        # Build the service object
+        service = build('drive', 'v3', credentials=creds)
+        return service, None
 
     except Exception as e:
-        print(f"Error building credentials: {e}")
-        return None, f"Error building credentials: {e}"
+        print(f"Error building credentials or Drive service: {e}")
+        return None, f"Error building credentials or Drive service: {e}"
 
 # Ensure Firestore is initialized on load
-# This is wrapped to prevent app crash if config is missing
-if initialize_firestore_client():
-    print("Firestore initialization confirmed.")
-else:
-    print("Firestore initialization skipped due to missing config.")
+initialize_firestore_client()
