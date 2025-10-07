@@ -154,7 +154,7 @@ def list_files(drive, folder_path):
             q=query,
             spaces='drive',
             fields='files(id, name, mimeType)',
-            orderBy='mimeType desc, name', # Folders first, then files by name
+            orderBy='folder, name', # FIXED: Removed 'mimeType desc' to resolve API error
             pageSize=50 # Max items to show
         ).execute()
 
@@ -206,8 +206,9 @@ def upload_file(drive, folder_path, temp_file_path, drive_file_name):
             'parents': [folder_id]
         }
         
-        media = MediaIoBaseDownload(io.FileIO(temp_file_path, 'rb'), drive_file_name)
-        
+        # Note: MediaIoBaseDownload is typically for downloading. For upload, we pass the path or handle it
+        # via the simpler 'media_body' parameter in the create call (which requires the path).
+
         # Use simple upload mode to handle larger files without full media body setup
         file = drive.files().create(
             body=file_metadata,
@@ -344,9 +345,9 @@ def summarize_folder(drive, folder_path, openai_api_key, openai_model_name):
             file_id = item['id']
             file_mime_type = item['mimeType']
             
-            # Use 'text/plain' as the target export format for documents
-            if file_mime_type in EXPORTABLE_MIMETYPES:
-                # Use export_media for convertable document types
+            # Determine if we need to export (convert) or just download
+            if file_mime_type in EXPORTABLE_MIMETYPES or file_mime_type.startswith('application/vnd.google-apps.'):
+                # Use export_media for convertable document types (PDF, Docs, Sheets, etc.)
                 request = drive.files().export_media(fileId=file_id, mimeType='text/plain')
             else:
                 # Use get_media for binary files that are already text (e.g., .txt)
@@ -359,7 +360,6 @@ def summarize_folder(drive, folder_path, openai_api_key, openai_model_name):
                 status, done = downloader.next_chunk()
             
             # Attempt to decode content, ignoring errors for robustness
-            # The ignore errors handles the case where non-text files might be present
             full_text += fh.getvalue().decode('utf-8', errors='ignore')
             full_text += "\n---\n" # Separator between file contents
         
