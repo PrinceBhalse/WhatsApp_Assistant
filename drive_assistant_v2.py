@@ -222,6 +222,28 @@ def move_file(drive_service, parent_folder_path, file_name, destination_folder_p
     except Exception as e:
         return f"❌ An unexpected error occurred during move: {e}"
 
+def rename_file(drive, old_file_name, new_file_name):
+    """Renames a file found anywhere in the user's drive."""
+    file_id, error = get_file_by_name_anywhere(drive, old_file_name)
+    if error:
+        return f"❌ Error: {error}"
+
+    try:
+        file_metadata = {'name': new_file_name}
+        drive.files().update(
+            fileId=file_id,
+            body=file_metadata,
+            fields='id'
+        ).execute()
+
+        return f"✏️ Successfully renamed '{old_file_name}' to '{new_file_name}'."
+
+    except HttpError as error:
+        return f"❌ An error occurred during rename: {error}"
+    except Exception as e:
+        return f"❌ An unknown error occurred during rename: {e}"
+
+
 
 def upload_file(drive_service, folder_path, temp_file_path_full, drive_file_name):
     """
@@ -382,4 +404,5 @@ def summarize_folder_contents(drive_service, folder_path, client, openai_model_n
     except Exception as e:
         # Catch network or OpenAI API errors
         return f"❌ An unexpected error occurred during summarization: {e}"
+
 
