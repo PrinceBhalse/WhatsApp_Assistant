@@ -107,6 +107,42 @@ def get_file_by_name(drive, folder_path, file_name):
     except Exception as e:
         return None, f"An unknown error occurred: {e}"
 
+def get_file_id_by_name_and_path(drive_service, parent_folder_path, file_name):
+    """
+    Finds a file ID given its parent folder path and exact file name.
+    Returns the file ID (string) or None if not found.
+    """
+    parent_id = get_folder_id(drive_service, parent_folder_path)
+    if not parent_id:
+        # Parent folder not found
+        return None, f"Parent folder '{parent_folder_path}' not found."
+
+    query = (
+        f"'{parent_id}' in parents and "
+        f"name = '{file_name}' and "
+        "trashed = false and "
+        # Exclude folders, we are looking for a file
+        "mimeType != 'application/vnd.google-apps.folder'" 
+    )
+    
+    try:
+        results = drive_service.files().list(
+            q=query,
+            fields="files(id, name)",
+            spaces='drive'
+        ).execute()
+
+        items = results.get('files', [])
+        if not items:
+            return None, f"File '{file_name}' not found in folder '{parent_folder_path}'."
+            
+        return items[0]['id'], None
+
+    except HttpError as e:
+        return None, f"Drive API Error during file search: {e}"
+    except Exception as e:
+        return None, f"Unexpected Error during file search: {e}"
+
 
 def get_file_by_name_anywhere(drive, file_name):
     """
@@ -142,47 +178,50 @@ def get_file_by_name_anywhere(drive, file_name):
 
 # --- Core Drive Commands ---
 
-def list_files(drive, folder_path):
-    """Lists files and folders in a specific Drive path."""
-    folder_id, error = get_folder_id(drive, folder_path)
-    if error:
-        return f"❌ Error: {error}"
-
+def list_files_in_folder(drive_service, folder_path):
+    """
+    Lists the contents (files and folders) of a specified Google Drive path.
+    """
+    folder_id = get_folder_id(drive_service, folder_path)
+    
     if not folder_id:
-        return f"❌ Folder '{folder_path}' not found."
+        return f"❌ Folder not found: {folder_path}"
 
     try:
-        query = f"'{folder_id}' in parents and trashed=false"
-        
-        response = drive.files().list(
+        # Query for all files and folders that are children of the folder_id
+        query = f"'{folder_id}' in parents and trashed = false"
+
+        results = drive_service.files().list(
             q=query,
-            spaces='drive',
-            fields='files(id, name, mimeType)',
-            orderBy='folder, name', # FIXED: Removed 'mimeType desc' to resolve API error
-            pageSize=50 # Max items to show
+            fields="files(id, name, mimeType, size)",
+            spaces='drive'
         ).execute()
 
-        items = response.get('files', [])
-        
+        items = results.get('files', [])
+
         if not items:
             return f"📂 Folder /{folder_path} is empty."
 
-        output = f"📂 *Contents of /{folder_path}:*\n"
-        for item in items:
-            name = item['name']
-            mime_type = item['mimeType']
-            
-            if mime_type == 'application/vnd.google-apps.folder':
-                output += f"  > *{name}/*\n"
-            else:
-                output += f"  - {name}\n"
+        output = [f"📂 Contents of /{folder_path}:"]
         
-        return output
+        for item in items:
+            is_folder = item['mimeType'] == 'application/vnd.google-apps.folder'
+            
+            if is_folder:
+                output.append(f"  [DIR] {item['name']} (ID: {item['id']})")
+            else:
+                # Format file size for readability
+                size_bytes = int(item.get('size', 0) or 0)
+                size_str = f"{size_bytes / (1024 * 1024):.2f} MB" if size_bytes > 0 else "N/A"
+                output.append(f"  [FILE] {item['name']} ({size_str}) (ID: {item['id']})")
+                
+        return "\n".join(output)
 
     except HttpError as error:
-        return f"❌ An error occurred while listing files: {error}"
+        return f"❌ An error occurred during file listing: {error}"
     except Exception as e:
-        return f"❌ An unknown error occurred: {e}"
+        return f"❌ An unexpected error occurred: {e}"
+
 
 
 def upload_file(drive_service, folder_path, temp_file_path_full, drive_file_name):
@@ -256,60 +295,65 @@ def rename_file(drive, old_file_name, new_file_name):
         return f"❌ An unknown error occurred during rename: {e}"
 
 
-def delete_file(drive, folder_path, file_name):
-    """Moves a file in a specified folder to the trash."""
-    file_id, error = get_file_by_name(drive, folder_path, file_name)
-    if error:
-        return f"❌ Error: {error}"
+def delete_item(drive_service, parent_folder_path, item_name):
+    """
+    Deletes a file from Google Drive using its parent folder path and name.
+    """
+    # Use the helper to find the ID of the file to delete
+    item_id, error = get_file_id_by_name_and_path(drive_service, parent_folder_path, item_name)
+    
+    if not item_id:
+        # If the file wasn't found, the error message from the helper is returned
+        return f"❌ Deletion failed: {error}"
 
     try:
-        # Setting 'trashed' to true moves the file to the trash
-        file_metadata = {'trashed': True}
-        drive.files().update(
-            fileId=file_id, 
-            body=file_metadata, 
-            fields='id, trashed'
-        ).execute()
-
-        return f"🗑️ Successfully moved file '{file_name}' to trash."
+        # Simply calling delete with the file ID trashes the file
+        drive_service.files().delete(fileId=item_id).execute()
+        return f"✅ Successfully deleted (trashed) item '{item_name}' (ID: {item_id})."
 
     except HttpError as error:
-        return f"❌ An error occurred during deletion: {error}"
+        return f"❌ Deletion failed due to a Drive API error: {error}"
     except Exception as e:
-        return f"❌ An unknown error occurred during deletion: {e}"
+        return f"❌ An unexpected error occurred during deletion: {e}"
 
 
-def move_file(drive, source_folder, file_name, dest_folder):
-    """Moves a file from the source folder to the destination folder."""
-    file_id, error = get_file_by_name(drive, source_folder, file_name)
-    if error:
-        return f"❌ Error: {error}"
-        
-    dest_folder_id, error = get_folder_id(drive, dest_folder)
-    if error:
-        return f"❌ Destination Error: {error}"
-    if not dest_folder_id:
-        return f"❌ Destination folder '{dest_folder}' not found."
+def move_file(drive_service, parent_folder_path, file_name, destination_folder_path):
+    """
+    Moves a file between two folders using its parent path, name, and the new destination path.
+    """
+    # 1. Get the ID of the file to move
+    file_id, error = get_file_id_by_name_and_path(drive_service, parent_folder_path, file_name)
+    
+    if not file_id:
+        return f"❌ Move failed: {error}"
+
+    # 2. Get the IDs of the current parent and the destination parent
+    current_parent_id = get_folder_id(drive_service, parent_folder_path)
+    destination_id = get_folder_id(drive_service, destination_folder_path)
+
+    if not destination_id:
+        return f"❌ Move failed: Destination folder '{destination_folder_path}' not found."
 
     try:
-        # 1. Get the current parents (to find the source folder ID)
-        file = drive.files().get(fileId=file_id, fields='parents').execute()
-        current_parent_id = file.get('parents')[0] # Assuming one parent for simplicity
-
-        # 2. Update the file: remove current parent, add new parent
-        drive.files().update(
+        # Retrieve the file's current parents to remove them
+        file = drive_service.files().get(fileId=file_id, fields='parents').execute()
+        
+        # Drive API update requires removing the old parents and adding the new ones
+        updated_file = drive_service.files().update(
             fileId=file_id,
-            addParents=dest_folder_id,
-            removeParents=current_parent_id,
+            # String of IDs to remove (old parents)
+            removeParents=','.join(file['parents']),
+            # String of IDs to add (new parent)
+            addParents=destination_id,
             fields='id, parents'
         ).execute()
 
-        return f"➡️ Successfully moved '{file_name}' from /{source_folder} to /{dest_folder}."
+        return f"✅ Successfully moved '{file_name}' from /{parent_folder_path} to /{destination_folder_path}."
 
     except HttpError as error:
-        return f"❌ An error occurred during move: {error}"
+        return f"❌ Move failed due to a Drive API error: {error}"
     except Exception as e:
-        return f"❌ An unknown error occurred during move: {e}"
+        return f"❌ An unexpected error occurred during move: {e}"
 
 
 def summarize_folder(drive, folder_path, openai_api_key, openai_model_name):
@@ -401,6 +445,7 @@ def summarize_folder(drive, folder_path, openai_api_key, openai_model_name):
         return f"❌ A Google Drive API error occurred: {error}"
     except Exception as e:
         return f"❌ An unexpected error occurred during summarization: {e}"
+
 
 
 
