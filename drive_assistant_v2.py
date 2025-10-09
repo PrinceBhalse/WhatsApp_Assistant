@@ -20,51 +20,53 @@ EXPORTABLE_MIMETYPES = [
 
 # --- Helper Functions ---
 
-def get_folder_id(drive, folder_path):
+def get_folder_id(drive_service, folder_path):
     """
-    Traverses the Drive structure to find the ID of the target folder path.
-    Example: 'Reports/2024/Q1'
+    Finds the ID of the folder based on its path (e.g., 'Reports/Q3/2025').
+    Returns the folder ID (string) or None if any segment of the path is not found.
     """
-    current_parent_id = 'root'  # Start from the root of the user's Drive
+    current_parent_id = 'root'  # Start from the root of Google Drive
 
-    # Ensure folder_path is clean and split into segments
-    segments = [s.strip() for s in folder_path.strip('/').split('/') if s.strip()]
+    # Split the path, removing any leading/trailing slashes
+    folder_names = [name.strip() for name in folder_path.split('/') if name.strip()]
 
-    if not segments:
-        return 'root', None
+    if not folder_names:
+        # If folder_path is empty or '/', the intent is likely the root.
+        # But for 'parents' field in upload, we should usually use a specific folder ID, 
+        # so returning 'root' here is only if the path is truly empty.
+        return 'root'
 
-    for segment in segments:
+    for folder_name in folder_names:
+        # Search for the current folder name within the current parent ID
+        query = (
+            f"'{current_parent_id}' in parents and "
+            f"name = '{folder_name}' and "
+            f"mimeType = 'application/vnd.google-apps.folder' and "
+            "trashed = false"
+        )
         try:
-            # Search for the folder by name and parent ID
-            # q: name='folder_name' and mimeType='folder' and 'parent_id' in parents and trashed=false
-            query = (
-                f"name='{segment}' and mimeType='application/vnd.google-apps.folder' "
-                f"and '{current_parent_id}' in parents and trashed=false"
-            )
-            
-            # Using the native Google API Client to list files
-            response = drive.files().list(
+            results = drive_service.files().list(
                 q=query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name)',
-                pageSize=1
+                fields="files(id, name)",
+                spaces='drive'
             ).execute()
 
-            files = response.get('files', [])
-
-            if not files:
-                return None, f"Folder segment not found: '{segment}'"
-
-            # Found the folder, update the current parent ID for the next segment
-            current_parent_id = files[0]['id']
-
-        except HttpError as error:
-            return None, f"An error occurred while searching for folder '{segment}': {error}"
+            items = results.get('files', [])
+            if not items:
+                # CRITICAL: Folder not found at this level, stop and return None
+                return None
+                
+            # Update parent ID for the next segment of the path
+            current_parent_id = items[0]['id']
+        except HttpError as e:
+            print(f"Drive API Error during folder search for '{folder_name}': {e}")
+            return None
         except Exception as e:
-            return None, f"An unknown error occurred: {e}"
+            print(f"Unexpected Error during folder search: {e}")
+            return None
 
-    # After the loop, current_parent_id holds the ID of the last segment (the target folder)
-    return current_parent_id, None
+    # After iterating through all path segments, current_parent_id is the final folder ID
+    return current_parent_id
 
 
 def get_file_by_name(drive, folder_path, file_name):
@@ -399,6 +401,7 @@ def summarize_folder(drive, folder_path, openai_api_key, openai_model_name):
         return f"❌ A Google Drive API error occurred: {error}"
     except Exception as e:
         return f"❌ An unexpected error occurred during summarization: {e}"
+
 
 
 
