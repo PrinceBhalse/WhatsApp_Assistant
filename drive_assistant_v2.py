@@ -107,6 +107,38 @@ def get_file_id_by_name_and_path(drive_service, parent_folder_path, file_name):
         return None, f"Unexpected Error during file search: {e}"
 
 
+def get_file_by_name_anywhere(drive, file_name):
+    """
+    Finds a single file anywhere in the user's drive (used primarily by RENAME).
+    Returns file_id or None.
+    """
+    try:
+        # q: name='file_name' and mimeType!='folder' and trashed=false
+        query = (
+            f"name='{file_name}' and mimeType!='application/vnd.google-apps.folder' "
+            f"and trashed=false"
+        )
+
+        response = drive.files().list(
+            q=query,
+            spaces='drive',
+            fields='files(id, name)',
+            pageSize=1
+        ).execute()
+
+        files = response.get('files', [])
+
+        if files:
+            return files[0]['id'], None
+        else:
+            return None, f"File '{file_name}' not found anywhere in your Drive."
+
+    except HttpError as error:
+        return None, f"An error occurred while searching for file: {error}"
+    except Exception as e:
+        return None, f"An unknown error occurred: {e}"
+
+
 # --- Core Drive Operations ---
 
 def list_files(drive_service, folder_path):
@@ -404,5 +436,6 @@ def summarize_folder_contents(drive_service, folder_path, client, openai_model_n
     except Exception as e:
         # Catch network or OpenAI API errors
         return f"❌ An unexpected error occurred during summarization: {e}"
+
 
 
