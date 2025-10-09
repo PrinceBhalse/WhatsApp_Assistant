@@ -181,47 +181,44 @@ def list_files(drive, folder_path):
         return f"❌ An unknown error occurred: {e}"
 
 
-def upload_file(drive, folder_path, temp_file_path, drive_file_name):
-    """Uploads a local file to a specified folder path."""
-    folder_id, error = get_folder_id(drive, folder_path)
-    if error:
-        return f"❌ Error: {error}"
+def upload_file(drive_service, folder_path, temp_file_path_full, drive_file_name):
+    """
+    Uploads a file from a temporary local path to the specified Google Drive folder.
+    """
+    folder_id = get_folder_id(drive_service, folder_path)
 
     if not folder_id:
-        # If the target folder doesn't exist, create it (simplified to only create the last segment)
-        try:
-            folder_metadata = {
-                'name': folder_path.split('/')[-1],
-                'mimeType': 'application/vnd.google-apps.folder',
-                'parents': [get_folder_id(drive, '/')[0]] # Use root parent for simplicity if it doesn't exist
-            }
-            folder = drive.files().create(body=folder_metadata, fields='id').execute()
-            folder_id = folder.get('id')
-        except Exception as e:
-            return f"❌ Folder '{folder_path}' not found and could not be created: {e}"
+        return f"❌ Upload failed: Destination folder '{folder_path}' not found."
 
+    file_metadata = {
+        'name': drive_file_name,
+        'parents': [folder_id]
+    }
+
+    # Determine the MIME type (Drive often guesses correctly, but we need the path)
+
+    from mimetypes import MimeTypes
+    mime = MimeTypes()
+    guessed_mime_type = mime.guess_type(drive_file_name)[0] or 'application/octet-stream'
+
+    media = None
     try:
-        file_metadata = {
-            'name': drive_file_name,
-            'parents': [folder_id]
-        }
-        
-        # Note: MediaIoBaseDownload is typically for downloading. For upload, we pass the path or handle it
-        # via the simpler 'media_body' parameter in the create call (which requires the path).
-
-        # Use simple upload mode to handle larger files without full media body setup
-        file = drive.files().create(
+        media = drive_service.files().create(
             body=file_metadata,
-            media_body=temp_file_path, # Path to the file content
+            media_body=temp_file_path_full,
+            media_mime_type=guessed_mime_type,
             fields='id'
         ).execute()
-        
+
         return f"✅ Successfully uploaded '{drive_file_name}' to /{folder_path}."
 
     except HttpError as error:
-        return f"❌ An error occurred during upload: {error}"
+        print(f"Upload failed: {error}")
+        return f"❌ Upload failed due to a Drive API error. Details: {error}"
     except Exception as e:
-        return f"❌ An unknown error occurred during upload: {e}"
+        print(f"Unexpected upload error: {e}")
+        return f"❌ An unexpected error occurred during upload: {e}"
+
 
 
 def rename_file(drive, old_file_name, new_file_name):
@@ -391,3 +388,4 @@ def summarize_folder(drive, folder_path, openai_api_key, openai_model_name):
         return f"❌ A Google Drive API error occurred: {error}"
     except Exception as e:
         return f"❌ An unexpected error occurred during summarization: {e}"
+
