@@ -1,7 +1,7 @@
 import os
 import io
 import requests
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaFileUpload
 from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 from openai import OpenAI
@@ -415,5 +415,6 @@ def summarize_folder(drive, folder_path, openai_api_key, openai_model_name):
         return f"❌ A Google Drive API error occurred: {error}"
     except Exception as e:
         return f"❌ An unexpected error occurred during summarization: {e}"
+
 
 
