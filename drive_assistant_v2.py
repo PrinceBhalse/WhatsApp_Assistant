@@ -348,7 +348,7 @@ def download_file(drive_service, file_id, download_path):
         return f"❌ An unexpected error occurred during download: {e}"
 
 
-def summarize_folder_contents(drive_service, folder_path, client, openai_model_name="gpt-4o"):
+def summarize_folder(drive_service, folder_path, client, openai_model_name="gpt-4o"):
     """
     Finds all text-extractable files in a folder, concatenates their content, and generates a summary using OpenAI.
     """
@@ -436,6 +436,7 @@ def summarize_folder_contents(drive_service, folder_path, client, openai_model_n
     except Exception as e:
         # Catch network or OpenAI API errors
         return f"❌ An unexpected error occurred during summarization: {e}"
+
 
 
 
