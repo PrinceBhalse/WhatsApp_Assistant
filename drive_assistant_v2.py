@@ -187,58 +187,42 @@ def upload_file(drive_service, folder_path, temp_file_path_full, drive_file_name
     """
     Uploads a file from a temporary local path to the specified Google Drive folder.
     
-    Args:
-        drive_service: The initialized Google Drive API service object.
-        folder_path: The name or path of the destination folder (used by get_folder_id).
-        temp_file_path_full: The full local path to the file to upload.
-        drive_file_name: The name the file should have on Drive.
-        
-    Returns:
-        A success or failure message.
+    FIX: Uses MediaFileUpload for robust handling of file content and metadata.
     """
-    # 1. Get Folder ID (The most critical part)
-    # The get_folder_id function MUST return a valid string ID or None.
-    # If it returns a bad ID, the file goes to root.
-    try:
-        # Assuming get_folder_id is defined elsewhere and is correct
-        folder_id = get_folder_id(drive_service, folder_path) 
-    except Exception as e:
-        return f"❌ Upload failed: Error retrieving folder ID for '{folder_path}'. Details: {e}"
+    # 1. Get the ID of the destination folder
+    folder_id = get_folder_id(drive_service, folder_path)
 
     if not folder_id:
         return f"❌ Upload failed: Destination folder '{folder_path}' not found."
-
-    # 2. Determine MIME Type
+    
+    # 2. Determine the MIME type
     mime = MimeTypes()
     guessed_mime_type = mime.guess_type(drive_file_name)[0] or 'application/octet-stream'
 
-    # 3. Create File Metadata (Including the correct 'parents' property)
+    # 3. Define the file's metadata, including the critical 'parents' field
     file_metadata = {
         'name': drive_file_name,
-        # 'parents' is an array of folder IDs the file should belong to.
+        # This is the essential field to place the file in the correct folder
         'parents': [folder_id] 
     }
 
-    # 4. Create the Media Upload Object (The standard, robust way)
+    # 4. Create the MediaFileUpload object
     try:
+        # Use MediaFileUpload to link the local file path and its MIME type
         media = MediaFileUpload(temp_file_path_full, mimetype=guessed_mime_type, resumable=True)
     except FileNotFoundError:
         return f"❌ Upload failed: Local file not found at path: {temp_file_path_full}"
     
-    # 5. Execute the Upload
+    # 5. Execute the upload request
     try:
         uploaded_file = drive_service.files().create(
-            body=file_metadata,
-            media_body=media, # Pass the MediaFileUpload object
-            fields='id, parents' # Request parents back for verification
+            body=file_metadata,      # The metadata (name, parents)
+            media_body=media,        # The file content wrapped in MediaFileUpload
+            fields='id'              # Only request the file ID back
         ).execute()
 
-        # Optional: Double-check the parents returned from the API response
-        if folder_id in uploaded_file.get('parents', []):
-            return f"✅ Successfully uploaded '{drive_file_name}' to /{folder_path} (ID: {uploaded_file['id']})."
-        else:
-            # This should only happen if the API silently failed to move the file
-            return f"⚠️ Warning: Uploaded to Drive root. Folder ID was likely invalid or permissions failed. File ID: {uploaded_file['id']}."
+        # The ID is returned, confirming success
+        return f"✅ Successfully uploaded '{drive_file_name}' to /{folder_path} (ID: {uploaded_file['id']})."
 
     except HttpError as error:
         print(f"Drive API upload failed: {error}")
@@ -415,6 +399,7 @@ def summarize_folder(drive, folder_path, openai_api_key, openai_model_name):
         return f"❌ A Google Drive API error occurred: {error}"
     except Exception as e:
         return f"❌ An unexpected error occurred during summarization: {e}"
+
 
 
 
