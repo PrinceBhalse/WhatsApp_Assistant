@@ -140,7 +140,7 @@ def list_files(drive_service, folder_path):
             is_folder = item['mimeType'] == 'application/vnd.google-apps.folder'
             
             if is_folder:
-                output.append(f"  [DIR] {item['name']} (ID: {item['id']})")
+                output.append(f"   {item['name']} ")
             else:
                 # Format file size for readability
                 size_bytes = int(item.get('size', 0) or 0)
@@ -382,3 +382,4 @@ def summarize_folder_contents(drive_service, folder_path, client, openai_model_n
     except Exception as e:
         # Catch network or OpenAI API errors
         return f"❌ An unexpected error occurred during summarization: {e}"
+
