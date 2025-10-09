@@ -188,7 +188,7 @@ def list_files(drive_service, folder_path):
         return f"❌ An unexpected error occurred: {e}"
 
 
-def delete_item(drive_service, parent_folder_path, item_name):
+def delete_file(drive_service, parent_folder_path, item_name):
     """
     Deletes a file (or non-empty folder, if found by the helper) from Google Drive using its path and name.
     """
@@ -436,6 +436,7 @@ def summarize_folder_contents(drive_service, folder_path, client, openai_model_n
     except Exception as e:
         # Catch network or OpenAI API errors
         return f"❌ An unexpected error occurred during summarization: {e}"
+
 
 
 
