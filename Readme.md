@@ -12,8 +12,8 @@ This assistant supports the following commands, sent as messages via WhatsApp:
 | :---- | :---- | :---- |
 | **SETUP** | SETUP | Initiates the Google Drive authentication flow. **Required once.** |
 | **LIST** | LIST/\<folder\_path\> | Lists files and folders inside the specified path. |
-| **UPLOAD** | (Send media \+ caption) | Upload a media file directly to a target folder path. |
-| **RENAME** | RENAME/\<old\_file\_name\>/\<new\_file\_name\> | Renames a file found anywhere in your Drive. |
+| **UPLOAD** | (Send media \+ caption[UPLOAD/ <folder_name> <file_name>]) | Upload a media file directly to a target folder path. |
+| **RENAME** | RENAME \<old\_file\_name\> \<new\_file\_name\> | Renames a file found anywhere in your Drive. |
 | **MOVE** | MOVE/\<source\_folder\>/\<file\_name\>/\<destination\_folder\> | Moves a file between two specified folders. |
 | **DELETE** | DELETE/\<folder\_path\>/\<file\_name\> | Moves the specified file to the Drive trash. |
 | **SUMMARY** | SUMMARY/\<folder\_path\> | Generates an AI summary of all documents (TXT, PDF, DOCX, Google Docs) in the specified folder. |
